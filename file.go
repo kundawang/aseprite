@@ -142,15 +142,16 @@ func (f *frame) Read(raw []byte) ([]byte, error) {
 }
 
 type file struct {
-	framew      int
-	frameh      int
-	flags       uint16
-	bpp         uint16
-	transparent uint8
-	palette     color.Palette
-	frames      []frame
-	layers      []layer
-	makeCel     func(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel
+	framew        int
+	frameh        int
+	flags         uint16
+	bpp           uint16
+	transparent   uint8
+	palette       color.Palette
+	framePalettes []color.Palette
+	frames        []frame
+	layers        []layer
+	makeCel       func(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel
 }
 
 func (f *file) ReadFrom(r io.Reader) (int64, error) {
@@ -192,7 +193,9 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 	for i := range f.palette {
 		f.palette[i] = color.Black
 	}
-	f.palette[f.transparent] = color.Transparent
+	if len(f.palette) > 0 {
+		f.palette[f.transparent] = color.Transparent
+	}
 
 	fileSize := int64(binary.LittleEndian.Uint32(raw))
 	raw = make([]byte, fileSize-128)
@@ -214,14 +217,40 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 	return fileSize, nil
 }
 
+func palettesEqual(a, b color.Palette) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 	var atlasr image.Rectangle
 	atlasr, framesr = makeAtlasFrames(len(f.frames), f.framew, f.frameh)
 
-	switch f.bpp {
-	case 8:
-		atlas = image.NewPaletted(atlasr, f.palette)
-	case 16:
+	// A paletted atlas can only represent a single palette. When the frames
+	// animate their palettes the colors differ between frames, so an RGBA atlas
+	// is used instead and every frame is rendered with its own palette.
+	palettedAtlas := f.bpp == 8
+	if palettedAtlas {
+		base := f.framePalettes[0]
+		for _, p := range f.framePalettes[1:] {
+			if !palettesEqual(base, p) {
+				palettedAtlas = false
+				break
+			}
+		}
+	}
+
+	switch {
+	case palettedAtlas:
+		atlas = image.NewPaletted(atlasr, f.framePalettes[0])
+	case f.bpp == 16:
 		atlas = image.NewNRGBA(atlasr)
 	default:
 		atlas = image.NewRGBA(atlasr)
@@ -235,6 +264,8 @@ func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 	transparent := &image.Uniform{color.Transparent}
 
 	for i, fr := range f.frames {
+		framePalette := f.framePalettes[i]
+
 		draw.Draw(dst, framebounds, transparent, image.Point{}, draw.Src)
 		for layer, c := range fr.cels {
 			if c.image == nil {
@@ -245,12 +276,18 @@ func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 			sr := src.Bounds()
 			sp := sr.Min
 
-			// Correction to avoid palette index errors if a color has been deleted from the Aseprite palette.
+			// Bind indexed cels to the palette that is effective for this
+			// frame. Pixel indices stay unchanged while palette-only
+			// animation recolors them frame by frame. Linked cels share the
+			// same image and are re-bound as each frame is rendered.
 			if imgPaletted, ok := src.(*image.Paletted); ok {
-				for i := range imgPaletted.Pix {
-					if int(imgPaletted.Pix[i]) >= len(f.palette) {
+				imgPaletted.Palette = framePalette
+
+				// Correction to avoid palette index errors if a color has been deleted from the Aseprite palette.
+				for k := range imgPaletted.Pix {
+					if int(imgPaletted.Pix[k]) >= len(framePalette) {
 						// Assign a transparent index if the index is outside the palette range.
-						imgPaletted.Pix[i] = f.transparent
+						imgPaletted.Pix[k] = f.transparent
 					}
 				}
 			}
@@ -307,6 +344,7 @@ func (f *file) buildFrames(framesr []image.Rectangle, userdata []byte) ([]Frame,
 	for i, fr := range f.frames {
 		frames[i].Duration = fr.dur
 		frames[i].Bounds = framesr[i]
+		frames[i].Palette = f.framePalettes[i]
 		frames[i].Data = make([][]byte, 0, len(fr.cels))
 		for _, c := range fr.cels {
 			if nd := len(c.data); nd > 0 {

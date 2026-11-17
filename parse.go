@@ -10,11 +10,6 @@ import (
 	"io"
 )
 
-func skipString(raw []byte) []byte {
-	n := binary.LittleEndian.Uint16(raw)
-	return raw[2+n:]
-}
-
 func parseString(raw []byte) string {
 	n := binary.LittleEndian.Uint16(raw)
 	return string(raw[2 : 2+n])
@@ -45,112 +40,165 @@ func parseUserData(raw []byte) (data []byte, color color.Color) {
 	return
 }
 
-func (f *file) parseChunk2019(raw []byte) {
-	entries := binary.LittleEndian.Uint32(raw[0:])
-	lo := binary.LittleEndian.Uint32(raw[4:])
+// parseChunk2019 applies a new palette chunk (0x2019) to pal.
+//
+// Only the entries in the [first, last] range are present in the chunk and
+// only those entries are overwritten; every other index keeps its inherited
+// value. Writes outside the palette and truncated chunks are ignored without
+// panicking. Multiple entries targeting the same index are applied in order,
+// so the last one wins.
+//
+// https://github.com/aseprite/aseprite/blob/main/docs/ase-file-specs.md#palette-chunk-0x2019
+func parseChunk2019(pal color.Palette, raw []byte) {
+	if len(raw) < 20 || len(pal) == 0 {
+		return
+	}
 
+	first := binary.LittleEndian.Uint32(raw[4:])
+	last := binary.LittleEndian.Uint32(raw[8:])
 	raw = raw[20:]
 
-	for i := uint32(0); i < entries; i++ {
+	if last < first {
+		return
+	}
+
+	for i := first; i <= last; i++ {
+		// Each entry is a WORD of flags followed by four color bytes.
+		if len(raw) < 6 {
+			return
+		}
+
 		flags := binary.LittleEndian.Uint16(raw)
-		f.palette[lo+i] = parseColor(raw[2:])
+		if int(i) < len(pal) {
+			pal[i] = parseColor(raw[2:])
+		}
 		raw = raw[6:]
 
 		if flags&1 != 0 {
-			raw = skipString(raw)
+			if len(raw) < 2 {
+				return
+			}
+			n := int(binary.LittleEndian.Uint16(raw))
+			if len(raw) < 2+n {
+				return
+			}
+			raw = raw[2+n:]
 		}
 	}
+}
+
+// applyOldPalettePacket parses the shared packet structure of the old palette
+// chunks 0x0004 and 0x0011. rgb converts the three stored components into a
+// color. Indices outside the palette and truncated chunks are ignored.
+func applyOldPalettePacket(pal color.Palette, raw []byte, rgb func(r, g, b byte) color.NRGBA) []byte {
+	if len(raw) < 2 || len(pal) == 0 {
+		return nil
+	}
+
+	packets := int(binary.LittleEndian.Uint16(raw))
+	raw = raw[2:]
+
+	currentIndex := 0
+
+	for i := 0; i < packets; i++ {
+		if len(raw) < 2 {
+			return nil
+		}
+
+		// entries to skip from the previous packet
+		currentIndex += int(raw[0])
+
+		n := int(raw[1])
+		if n == 0 {
+			n = 256
+		}
+		raw = raw[2:]
+
+		for j := 0; j < n; j++ {
+			if len(raw) < 3 {
+				return nil
+			}
+
+			if currentIndex < len(pal) {
+				pal[currentIndex] = rgb(raw[0], raw[1], raw[2])
+			}
+			raw = raw[3:]
+			currentIndex++
+		}
+	}
+
+	return raw
 }
 
 // https://github.com/aseprite/aseprite/blob/main/docs/ase-file-specs.md#old-palette-chunk-0x0011
-func (f *file) parseChunk0011(raw []byte) {
-	packets := binary.LittleEndian.Uint16(raw)
-	raw = raw[2:]
-
-	currentIndex := 0
-
-	for i := 0; i < int(packets); i++ {
-		skip := int(raw[0])
-		currentIndex += skip
-
-		n := int(raw[1])
-		if n == 0 {
-			n = 256
-		}
-		raw = raw[2:]
-
-		for j := 0; j < n && currentIndex < len(f.palette); j++ {
-			f.palette[currentIndex] = color.NRGBA{
-				R: raw[0] * 4,
-				G: raw[1] * 4,
-				B: raw[2] * 4,
-				A: 255,
-			}
-			raw = raw[3:]
-			currentIndex++
-		}
-	}
+func parseChunk0011(pal color.Palette, raw []byte) {
+	// Components are stored in 6 bits and scaled back to 8 bits.
+	applyOldPalettePacket(pal, raw, func(r, g, b byte) color.NRGBA {
+		return color.NRGBA{R: r * 4, G: g * 4, B: b * 4, A: 255}
+	})
 }
 
 // https://github.com/aseprite/aseprite/blob/main/docs/ase-file-specs.md#old-palette-chunk-0x0004
-func (f *file) parseChunk0004(raw []byte) {
-	packets := binary.LittleEndian.Uint16(raw)
-	raw = raw[2:]
-
-	currentIndex := 0
-
-	for i := 0; i < int(packets); i++ {
-		skip := int(raw[0])
-		currentIndex += skip
-
-		n := int(raw[1])
-		if n == 0 {
-			n = 256
-		}
-		raw = raw[2:]
-
-		for j := 0; j < n && currentIndex < len(f.palette); j++ {
-			f.palette[currentIndex] = color.NRGBA{
-				R: raw[0],
-				G: raw[1],
-				B: raw[2],
-				A: 255,
-			}
-			raw = raw[3:]
-			currentIndex++
-		}
-	}
+func parseChunk0004(pal color.Palette, raw []byte) {
+	applyOldPalettePacket(pal, raw, func(r, g, b byte) color.NRGBA {
+		return color.NRGBA{R: r, G: g, B: b, A: 255}
+	})
 }
 
-func (f *file) initPalette() {
-	var chunk0004 []byte
-	var chunk0011 []byte
-	found2019 := false
+// initPalettes builds the effective palette of every frame by applying the
+// palette chunks frame by frame, starting from the black palette with the
+// transparent index set in the file header.
+//
+// A frame without a palette chunk inherits the previous frame's palette.
+// Within a frame, a 0x2019 chunk takes precedence over the old 0x0004 and
+// 0x0011 chunks. Chunks only modify the indices they declare; undeclared
+// indices are inherited. The transparent index is forced transparent after
+// every frame, so palette updates can never make it opaque.
+func (f *file) initPalettes() {
+	f.framePalettes = make([]color.Palette, len(f.frames))
 
-	for _, ch := range f.frames[0].chunks {
-		if ch.typ == 0x2019 {
-			f.parseChunk2019(ch.raw)
-			found2019 = true
-			break
-		}
-		if ch.typ == 0x0004 {
-			chunk0004 = ch.raw
-		}
-		if ch.typ == 0x0011 {
-			chunk0011 = ch.raw
-		}
+	// Only indexed sprites carry meaningful palette data; grayscale and RGBA
+	// sprites leave the per-frame palettes unset (nil).
+	if f.bpp != 8 || len(f.palette) == 0 {
+		return
 	}
 
-	if !found2019 {
-		if chunk0004 != nil {
-			f.parseChunk0004(chunk0004)
-		} else if chunk0011 != nil {
-			f.parseChunk0011(chunk0011)
-		}
+	current := make(color.Palette, len(f.palette))
+	for i := range current {
+		current[i] = color.Black
 	}
+	current[f.transparent] = color.Transparent
 
-	if f.flags&1 != 0 {
-		f.palette[f.transparent] = color.Transparent
+	for frame, fr := range f.frames {
+		var chunk0004, chunk0011 []byte
+		has2019 := false
+
+		for _, ch := range fr.chunks {
+			switch ch.typ {
+			case 0x2019:
+				parseChunk2019(current, ch.raw)
+				has2019 = true
+			case 0x0004:
+				chunk0004 = ch.raw
+			case 0x0011:
+				chunk0011 = ch.raw
+			}
+		}
+
+		// Old chunks are ignored when a 0x2019 chunk is present in the frame.
+		if !has2019 {
+			if chunk0004 != nil {
+				parseChunk0004(current, chunk0004)
+			} else if chunk0011 != nil {
+				parseChunk0011(current, chunk0011)
+			}
+		}
+
+		// The transparent index is defined by the header and always stays
+		// transparent, even when a palette chunk assigns it a color.
+		current[f.transparent] = color.Transparent
+
+		f.framePalettes[frame] = append(color.Palette(nil), current...)
 	}
 }
 

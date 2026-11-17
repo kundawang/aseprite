@@ -52,6 +52,12 @@ type Frame struct {
 	// in a tag animation loop.
 	Duration time.Duration
 
+	// Palette is the palette that is effective for this frame. It contains
+	// the accumulated palette changes of this frame and all previous frames.
+	// Frames without a palette change inherit the palette of the frame before
+	// them. It is nil for non-indexed sprites.
+	Palette color.Palette
+
 	// Data lists all optional user data set in the cels that make up the frame.
 	// The data of invisible and reference layers is not included.
 	Data [][]byte
@@ -104,7 +110,7 @@ func (spr *Aseprite) readFrom(r io.Reader) error {
 		return err
 	}
 
-	f.initPalette()
+	f.initPalettes()
 
 	if err := f.initLayers(); err != nil {
 		return err

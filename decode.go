@@ -39,8 +39,8 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 
 	switch f.bpp {
 	case 8:
-		f.initPalette()
-		colorModel = f.palette
+		f.initPalettes()
+		colorModel = f.framePalettes[0]
 	case 16:
 		colorModel = color.Gray16Model
 	default:

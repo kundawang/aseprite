@@ -58,6 +58,13 @@ func TestDecode(t *testing.T) {
 			Frames:   1,
 			Tags:     0,
 		},
+		{
+			Name:     "palette_animation",
+			Filename: "./testfiles/palette_anim.aseprite",
+			Outfile:  "palette_anim.png",
+			Frames:   3,
+			Tags:     0,
+		},
 	} {
 		t.Run(tt.Name, func(t *testing.T) {
 			f, err := os.Open(tt.Filename)
