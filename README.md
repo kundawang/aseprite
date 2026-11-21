@@ -53,6 +53,61 @@ sprite, err := aseprite.Read(f)
 
 Read the [documentation](https://pkg.go.dev/github.com/askeladdk/aseprite) for more information about what meta data is extracted.
 
+## Atlas metadata
+
+Each `Frame` carries everything a renderer needs to sample it from the
+texture atlas:
+
+- `Frame.Page` indexes into `Aseprite.Pages`, allowing the atlas to be
+  split over multiple texture pages.
+- `Frame.Bounds` is the page-local pixel rectangle of the frame content.
+- `Frame.Padding` is the number of extruded padding pixels around the
+  content. `Frame.UV` always describes the content, never the ring.
+- `Frame.UV` is the half-open normalized coordinate rectangle of the
+  content within its page.
+- `Frame.Rotated`, `Frame.FlipH` and `Frame.FlipV` are reserved
+  transform markers. The decoder never rotates or flips frames, so they
+  are always false.
+
+`Read` keeps the historical compact single-page layout. Use `ReadWith`
+to control the layout:
+
+```go
+sprite, err := aseprite.ReadWith(f, aseprite.Options{
+    Padding:       2, // extrude a 2px border ring against page bleeding
+    MaxPageWidth:  1024,
+    MaxPageHeight: 1024,
+})
+```
+
+### UV semantics
+
+`UVRect` is half-open: `Min` is the upper-left corner and `Max` is the
+exclusive lower-right edge, so every normalized coordinate stays inside
+`[0, 1]` and adjacent frames never share an edge. Coordinates are
+normalized per axis by the page dimensions, so non-square pages are
+handled correctly, and normalization is relative to `Page.Bounds.Min`
+to support pages with a negative texture origin. Empty frames map to an
+empty `UVRect` (`Min == Max`).
+
+There are two equivalent ways to keep linear filtering from bleeding
+into neighboring texels:
+
+1. Extruded padding (`Options.Padding`): border texels are replicated
+   around every frame, so sampling just outside the content still
+   returns the frame's own pixels. Use the frame's `UV` unchanged.
+2. Half-texel inset on a padding-free atlas: shrink the UV rectangle by
+   half a texel using `UVRect.Inset`.
+
+```go
+page := sprite.Pages[frame.Page]
+d := aseprite.UV{
+    U: 0.5 / float32(page.Bounds.Dx()),
+    V: 0.5 / float32(page.Bounds.Dy()),
+}
+uv := frame.UV.Inset(d)
+```
+
 ## License
 
 Package aseprite is released under the terms of the ISC license.

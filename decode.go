@@ -1,15 +1,28 @@
 package aseprite
 
 import (
+	"errors"
 	"image"
 	"image/color"
 	"io"
 )
 
 // Read decodes an Aseprite image from r.
+// The atlas uses a single page with no padding.
 func Read(r io.Reader) (*Aseprite, error) {
+	return ReadWith(r, Options{})
+}
+
+// ReadWith decodes an Aseprite image from r using opts to control the
+// atlas layout. opts.Padding adds extruded padding around every frame
+// and opts.MaxPageWidth/opts.MaxPageHeight enable multi-page packing.
+func ReadWith(r io.Reader, opts Options) (*Aseprite, error) {
+	if opts.Padding < 0 {
+		return nil, errors.New("aseprite: padding must not be negative")
+	}
+
 	var spr Aseprite
-	if err := spr.readFrom(r); err != nil {
+	if err := spr.readFrom(r, opts); err != nil {
 		return nil, err
 	}
 

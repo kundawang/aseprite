@@ -45,8 +45,37 @@ type Tag struct {
 
 // Frame represents a single frame in the sprite.
 type Frame struct {
-	// Bounds is the image bounds of the frame in the sprite's atlas.
+	// Bounds is the image bounds of the frame's content in its page.
+	// Coordinates are page-local and match the page in Frame.Page.
+	// A frame without any visible cels has an empty rectangle.
 	Bounds image.Rectangle
+
+	// Page is the zero-based index of the atlas page that contains
+	// the frame, corresponding to an entry in Aseprite.Pages.
+	Page int
+
+	// Padding is the number of padding pixels extruded around Bounds
+	// on every side. It matches Options.Padding and is zero when the
+	// sprite was decoded without padding.
+	Padding int
+
+	// UV is the half-open normalized texture-coordinate rectangle of
+	// Bounds within its page. See FrameUV and UVRect for the exact
+	// half-open, non-square-page and negative-origin semantics.
+	UV UVRect
+
+	// Rotated reports whether the frame is stored rotated 90 degrees
+	// clockwise on the page. The decoder never rotates frames, so it
+	// is always false; the field is reserved for exporters and custom
+	// packers and documented so renderers handle it explicitly.
+	Rotated bool
+
+	// FlipH and FlipV report whether the frame is stored mirrored
+	// horizontally or vertically. The decoder never flips frames, so
+	// both are always false; the fields are reserved for exporters
+	// and custom packers.
+	FlipH bool
+	FlipV bool
 
 	// Duration is the time in seconds that the frame should be displayed for
 	// in a tag animation loop.
@@ -80,11 +109,18 @@ type Slice struct {
 
 // Aseprite holds the results of a parsed Aseprite image file.
 type Aseprite struct {
-	// Image contains all frame images in a single image.
-	// Frame bounds specify where the frame images are located.
+	// Image contains the first atlas page for backwards
+	// compatibility. Single-page sprites hold the whole atlas here.
+	// Prefer Pages when iterating frames.
 	image.Image
 
+	// Pages lists the atlas pages in page order. Frame.Page indexes
+	// into this slice. The slice is never empty for a successfully
+	// decoded sprite and its order is stable.
+	Pages []Page
+
 	// Frames lists all frames that make up the sprite.
+	// The order is the frame order stored in the sprite file.
 	Frames []Frame
 
 	// Tags lists all animation tags.
@@ -97,7 +133,7 @@ type Aseprite struct {
 	LayerData [][]byte
 }
 
-func (spr *Aseprite) readFrom(r io.Reader) error {
+func (spr *Aseprite) readFrom(r io.Reader, opts Options) error {
 	var f file
 
 	if _, err := f.ReadFrom(r); err != nil {
@@ -114,10 +150,14 @@ func (spr *Aseprite) readFrom(r io.Reader) error {
 		return err
 	}
 
-	var framesr []image.Rectangle
-	spr.Image, framesr = f.buildAtlas()
 	userdata := f.buildUserData()
-	spr.Frames, userdata = f.buildFrames(framesr, userdata)
+	var placements []framePlacement
+	spr.Pages, placements = f.buildAtlas(opts)
+	spr.Image = spr.Pages[0].Image
+	spr.Frames, userdata = f.buildFrames(placements, userdata)
+	for i := range spr.Frames {
+		spr.Frames[i].UV = FrameUV(spr.Pages[spr.Frames[i].Page].Bounds, spr.Frames[i].Bounds)
+	}
 	spr.LayerData = f.buildLayerData(userdata)
 	spr.Tags = f.buildTags()
 	spr.Slices = f.buildSlices()
