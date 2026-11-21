@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
@@ -15,6 +16,11 @@ import (
 )
 
 var errInvalidMagic = errors.New("invalid magic number")
+
+// maxFileSize bounds the declared file size a single sprite may claim. The
+// file size is read from untrusted input and used to allocate a buffer, so an
+// absurd declaration must be rejected before the allocation is made.
+const maxFileSize = 1 << 30 // 1 GiB
 
 type cel struct {
 	image image.Image
@@ -67,6 +73,9 @@ type layer struct {
 }
 
 func (l *layer) Parse(raw []byte) error {
+	if len(raw) < 13 {
+		return errors.New("truncated layer chunk")
+	}
 	if typ := binary.LittleEndian.Uint16(raw[2:]); typ == 2 {
 		return errors.New("tilemap layers not supported")
 	}
@@ -86,8 +95,20 @@ func (c chunk) Reader() io.Reader {
 }
 
 func (c *chunk) Read(raw []byte) ([]byte, error) {
+	if len(raw) < 6 {
+		return nil, errors.New("truncated chunk header")
+	}
+
 	chunkLen := binary.LittleEndian.Uint32(raw)
 	c.typ = int(binary.LittleEndian.Uint16(raw[4:]))
+
+	if chunkLen < 6 {
+		return nil, fmt.Errorf("invalid chunk length %d: shorter than its header", chunkLen)
+	}
+	if uint64(chunkLen) > uint64(len(raw)) {
+		return nil, fmt.Errorf("chunk length %d exceeds the %d bytes remaining", chunkLen, len(raw))
+	}
+
 	c.raw = raw[6:chunkLen]
 	return raw[chunkLen:], nil
 }
@@ -99,6 +120,10 @@ type frame struct {
 }
 
 func (f *frame) Read(raw []byte) ([]byte, error) {
+	if len(raw) < 16 {
+		return nil, errors.New("truncated frame header")
+	}
+
 	if magic := binary.LittleEndian.Uint16(raw[4:]); magic != 0xF1FA {
 		return nil, errInvalidMagic
 	}
@@ -110,19 +135,26 @@ func (f *frame) Read(raw []byte) ([]byte, error) {
 
 	f.dur = time.Millisecond * time.Duration(durationMS)
 
-	nchunks := int(newChunks)
+	nchunks := newChunks
 	if nchunks == 0 {
-		nchunks = int(oldChunks)
+		nchunks = uint32(oldChunks)
+	}
+	if uint64(nchunks) > uint64(len(raw))/6 {
+		return nil, fmt.Errorf("frame declares %d chunks but only %d bytes remain", nchunks, len(raw))
 	}
 
-	f.chunks = make([]chunk, nchunks)
+	f.chunks = make([]chunk, 0, nchunks)
 
 	raw = raw[16:]
 
-	for i := 0; i < nchunks; i++ {
+	var err error
+	for i := uint32(0); i < nchunks; i++ {
 		var c chunk
-		raw, _ = c.Read(raw)
-		f.chunks[i] = c
+		raw, err = c.Read(raw)
+		if err != nil {
+			return nil, fmt.Errorf("frame chunk %d: %w", i, err)
+		}
+		f.chunks = append(f.chunks, c)
 	}
 
 	return raw, nil
@@ -138,6 +170,33 @@ type file struct {
 	frames      []frame
 	layers      []layer
 	makeCel     func(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel
+}
+
+// maxSpriteBytes bounds the size of the atlas allocated for a sprite. Sprite
+// dimensions and the frame count come from untrusted input, and the atlas is
+// allocated before any cel is decoded, so an absurd declaration must be
+// rejected up front instead of attempting the allocation.
+const maxSpriteBytes = 1 << 30 // 1 GiB
+
+func spriteAtlasBytes(framew, frameh, nframes, bpp int) (int64, error) {
+	if framew <= 0 || frameh <= 0 || nframes <= 0 {
+		return 0, fmt.Errorf("invalid sprite dimensions %dx%d with %d frames", framew, frameh, nframes)
+	}
+
+	bytesPerPixel := int64(bpp) / 8
+	if bytesPerPixel <= 0 {
+		return 0, fmt.Errorf("invalid color depth %d", bpp)
+	}
+
+	// Frames are laid out in a power-of-two atlas, so the number of cells is
+	// at most twice the frame count.
+	cells := int64(nframes) * 2
+	n := cells * int64(framew) * int64(frameh) * bytesPerPixel
+	if n <= 0 || n > maxSpriteBytes {
+		return 0, fmt.Errorf("sprite dimensions %dx%d with %d frames exceed the %d byte limit", framew, frameh, nframes, maxSpriteBytes)
+	}
+
+	return n, nil
 }
 
 func (f *file) ReadFrom(r io.Reader) (int64, error) {
@@ -159,11 +218,25 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 
 	f.bpp = binary.LittleEndian.Uint16(raw[12:])
 	f.flags = binary.LittleEndian.Uint16(raw[14:])
-	f.frames = make([]frame, 0, binary.LittleEndian.Uint16(raw[6:]))
+	nframes := binary.LittleEndian.Uint16(raw[6:])
+	if nframes == 0 {
+		return 128, errors.New("sprite has no frames")
+	}
+	f.frames = make([]frame, 0, nframes)
 	f.framew = int(binary.LittleEndian.Uint16(raw[8:]))
 	f.frameh = int(binary.LittleEndian.Uint16(raw[10:]))
+	if f.framew <= 0 || f.frameh <= 0 {
+		return 128, fmt.Errorf("invalid sprite dimensions %dx%d", f.framew, f.frameh)
+	}
 	f.palette = make(color.Palette, binary.LittleEndian.Uint16(raw[32:]))
 	f.transparent = raw[28]
+
+	if f.bpp == 8 && len(f.palette) == 0 {
+		return 128, errors.New("indexed sprite has an empty palette")
+	}
+	if len(f.palette) > 0 && int(f.transparent) >= len(f.palette) {
+		return 128, fmt.Errorf("transparent color index %d out of range for palette of %d colors", f.transparent, len(f.palette))
+	}
 
 	switch f.bpp {
 	case 8:
@@ -176,12 +249,21 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 		return 0, errors.New("invalid color depth")
 	}
 
+	if _, err := spriteAtlasBytes(f.framew, f.frameh, int(nframes), int(f.bpp)); err != nil {
+		return 128, err
+	}
+
 	for i := range f.palette {
 		f.palette[i] = color.Black
 	}
-	f.palette[f.transparent] = color.Transparent
+	if len(f.palette) > 0 {
+		f.palette[f.transparent] = color.Transparent
+	}
 
 	fileSize := int64(binary.LittleEndian.Uint32(raw))
+	if fileSize < 128 || fileSize > maxFileSize {
+		return 128, fmt.Errorf("invalid file size %d", fileSize)
+	}
 	raw = make([]byte, fileSize-128)
 
 	if n, err := io.ReadFull(r, raw); err != nil {
@@ -196,6 +278,13 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 		}
 
 		f.frames = append(f.frames, fr)
+	}
+
+	// The header's frame count is only a capacity hint; the actual count comes
+	// from the data. Re-check the atlas bound for the real number of frames so
+	// a file with more frame records than declared cannot force a huge atlas.
+	if _, err := spriteAtlasBytes(f.framew, f.frameh, len(f.frames), int(f.bpp)); err != nil {
+		return fileSize, err
 	}
 
 	return fileSize, nil
