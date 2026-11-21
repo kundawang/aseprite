@@ -17,9 +17,10 @@ import (
 var errInvalidMagic = errors.New("invalid magic number")
 
 type cel struct {
-	image image.Image
-	mask  image.Uniform
-	data  []byte
+	image  image.Image
+	mask   image.Uniform
+	data   []byte
+	bounds image.Rectangle
 }
 
 func makeCelImage8(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
@@ -32,7 +33,7 @@ func makeCelImage8(f *file, bounds image.Rectangle, opacity byte, pix []byte) ce
 
 	mask := image.Uniform{color.Alpha{opacity}}
 
-	return cel{&img, mask, nil}
+	return cel{image: &img, mask: mask, bounds: bounds}
 }
 
 func makeCelImage16(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
@@ -44,7 +45,7 @@ func makeCelImage16(f *file, bounds image.Rectangle, opacity byte, pix []byte) c
 
 	mask := image.Uniform{color.Alpha{opacity}}
 
-	return cel{&img, mask, nil}
+	return cel{image: &img, mask: mask, bounds: bounds}
 }
 
 func makeCelImage32(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
@@ -56,23 +57,37 @@ func makeCelImage32(f *file, bounds image.Rectangle, opacity byte, pix []byte) c
 
 	mask := image.Uniform{color.Alpha{opacity}}
 
-	return cel{&img, mask, nil}
+	return cel{image: &img, mask: mask, bounds: bounds}
 }
 
 type layer struct {
 	flags     uint16
+	typ       uint16
 	blendMode uint16
 	opacity   byte
+	name      string
 	data      []byte
+	userData  UserData
 }
 
 func (l *layer) Parse(raw []byte) error {
-	if typ := binary.LittleEndian.Uint16(raw[2:]); typ == 2 {
+	if len(raw) < 13 {
+		return errors.New("truncated layer chunk")
+	}
+	l.typ = binary.LittleEndian.Uint16(raw[2:])
+	if l.typ == 2 {
 		return errors.New("tilemap layers not supported")
 	}
 	l.flags = binary.LittleEndian.Uint16(raw)
 	l.blendMode = binary.LittleEndian.Uint16(raw[10:])
 	l.opacity = raw[12]
+	// The layer name is a length-prefixed string at offset 16. A truncated
+	// name does not prevent loading the layer; it is left empty.
+	if len(raw) >= 18 {
+		if n := int(binary.LittleEndian.Uint16(raw[16:])); n <= len(raw)-18 {
+			l.name = string(raw[18 : 18+n])
+		}
+	}
 	return nil
 }
 
@@ -86,19 +101,43 @@ func (c chunk) Reader() io.Reader {
 }
 
 func (c *chunk) Read(raw []byte) ([]byte, error) {
+	if len(raw) < 6 {
+		return nil, errors.New("truncated chunk header")
+	}
+
 	chunkLen := binary.LittleEndian.Uint32(raw)
 	c.typ = int(binary.LittleEndian.Uint16(raw[4:]))
-	c.raw = raw[6:chunkLen]
-	return raw[chunkLen:], nil
+
+	// A chunk length is untrusted. Clamp it to the available bytes instead of
+	// slicing out of range so a truncated chunk (for example a truncated user
+	// data chunk at the end of a frame) is preserved as far as possible and
+	// does not prevent the rest of the frame from being decoded.
+	end := int(chunkLen)
+	if end < 6 {
+		end = 6
+	}
+	if end > len(raw) {
+		end = len(raw)
+	}
+
+	c.raw = raw[6:end]
+	return raw[end:], nil
 }
 
 type frame struct {
 	dur    time.Duration
 	chunks []chunk
 	cels   []cel
+	// celsInfo lists the metadata of every cel chunk in file order, including
+	// cels that were not composited.
+	celsInfo []Cel
 }
 
 func (f *frame) Read(raw []byte) ([]byte, error) {
+	if len(raw) < 16 {
+		return nil, errors.New("truncated frame header")
+	}
+
 	if magic := binary.LittleEndian.Uint16(raw[4:]); magic != 0xF1FA {
 		return nil, errInvalidMagic
 	}
@@ -115,14 +154,23 @@ func (f *frame) Read(raw []byte) ([]byte, error) {
 		nchunks = int(oldChunks)
 	}
 
-	f.chunks = make([]chunk, nchunks)
+	f.chunks = make([]chunk, 0, nchunks)
 
 	raw = raw[16:]
 
 	for i := 0; i < nchunks; i++ {
 		var c chunk
-		raw, _ = c.Read(raw)
-		f.chunks[i] = c
+		var err error
+		raw, err = c.Read(raw)
+		if err != nil {
+			// A frame that declares more chunks than are present is
+			// truncated. Keep the chunks that were read and stop parsing the
+			// file at this point: user data and other metadata parsing is
+			// best-effort and must not prevent pixels that are present from
+			// being decoded.
+			return nil, nil
+		}
+		f.chunks = append(f.chunks, c)
 	}
 
 	return raw, nil
@@ -289,9 +337,48 @@ func (f *file) buildFrames(framesr []image.Rectangle, userdata []byte) ([]Frame,
 				frames[i].Data = append(frames[i].Data, userdata[ofs:])
 			}
 		}
+		for _, c := range fr.celsInfo {
+			cel := c
+			cel.UserData = cloneUserData(c.UserData)
+			frames[i].Cels = append(frames[i].Cels, cel)
+		}
 	}
 
 	return frames, userdata
+}
+
+// buildLayers returns the structured metadata of all layers, in file order.
+func (f *file) buildLayers() []Layer {
+	layers := make([]Layer, len(f.layers))
+	for i, l := range f.layers {
+		layers[i] = Layer{
+			Index:     i,
+			Name:      l.name,
+			Flags:     l.flags,
+			Type:      l.typ,
+			BlendMode: l.blendMode,
+			Opacity:   l.opacity,
+			Visible:   l.flags&1 != 0,
+			Reference: l.flags&64 != 0,
+			UserData:  cloneUserData(l.userData),
+		}
+	}
+	return layers
+}
+
+// cloneUserData deep-copies the byte slices in u so the structured metadata
+// does not alias the decoder's internal buffers. It also marks an absent chunk
+// with a ChunkIndex of -1.
+func cloneUserData(u UserData) UserData {
+	if !u.Present {
+		u.ChunkIndex = -1
+		return u
+	}
+	u.Raw = append([]byte{}, u.Raw...)
+	if u.TextBytes != nil {
+		u.TextBytes = append([]byte{}, u.TextBytes...)
+	}
+	return u
 }
 
 func makeAtlasFrames(nframes, framew, frameh int) (atlasr image.Rectangle, framesr []image.Rectangle) {
