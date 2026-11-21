@@ -10,17 +10,23 @@ import (
 	"io"
 )
 
-func skipString(raw []byte) []byte {
-	n := binary.LittleEndian.Uint16(raw)
-	return raw[2+n:]
-}
-
+// parseString parses a length-prefixed string. Truncated input yields the
+// bytes that are present rather than panicking.
 func parseString(raw []byte) string {
-	n := binary.LittleEndian.Uint16(raw)
+	if len(raw) < 2 {
+		return ""
+	}
+	n := int(binary.LittleEndian.Uint16(raw))
+	if n > len(raw)-2 {
+		n = len(raw) - 2
+	}
 	return string(raw[2 : 2+n])
 }
 
 func parseColor(raw []byte) color.Color {
+	if len(raw) < 4 {
+		return color.NRGBA{}
+	}
 	return color.NRGBA{
 		R: raw[0],
 		G: raw[1],
@@ -29,13 +35,26 @@ func parseColor(raw []byte) color.Color {
 	}
 }
 
+// parseUserData parses a 0x2020 user data chunk. Truncated chunks yield
+// whatever fields are intact, which keeps a corrupt chunk from crashing the
+// decode; the data slice always owns its bytes.
 func parseUserData(raw []byte) (data []byte, color color.Color) {
+	if len(raw) < 4 {
+		return nil, nil
+	}
 	flags := binary.LittleEndian.Uint32(raw)
 	raw = raw[4:]
 
 	if flags&1 != 0 {
-		n := binary.LittleEndian.Uint16(raw)
-		data, raw = raw[2:2+n], raw[2+n:]
+		if len(raw) < 2 {
+			return nil, nil
+		}
+		n := int(binary.LittleEndian.Uint16(raw))
+		raw = raw[2:]
+		if n > len(raw) {
+			n = len(raw)
+		}
+		data, raw = raw[:n], raw[n:]
 	}
 
 	if flags&2 != 0 {
@@ -45,81 +64,97 @@ func parseUserData(raw []byte) (data []byte, color color.Color) {
 	return
 }
 
+// parseChunk2019 applies the entries declared by a new-style palette chunk
+// (0x2019) to the palette. Entries outside the palette and truncated chunks
+// are ignored; multiple entries for the same index are applied in order.
 func (f *file) parseChunk2019(raw []byte) {
-	entries := binary.LittleEndian.Uint32(raw[0:])
+	if len(raw) < 20 {
+		return
+	}
 	lo := binary.LittleEndian.Uint32(raw[4:])
+	last := binary.LittleEndian.Uint32(raw[8:])
 
 	raw = raw[20:]
 
-	for i := uint32(0); i < entries; i++ {
+	if last < lo {
+		return
+	}
+
+	for i := lo; i <= last; i++ {
+		if len(raw) < 6 {
+			return
+		}
 		flags := binary.LittleEndian.Uint16(raw)
-		f.palette[lo+i] = parseColor(raw[2:])
+		if int(i) < len(f.palette) {
+			f.palette[i] = parseColor(raw[2:])
+		}
 		raw = raw[6:]
 
 		if flags&1 != 0 {
-			raw = skipString(raw)
+			if len(raw) < 2 {
+				return
+			}
+			n := int(binary.LittleEndian.Uint16(raw))
+			if len(raw) < 2+n {
+				return
+			}
+			raw = raw[2+n:]
+		}
+	}
+}
+
+// parseOldPalette applies the packet structure shared by the old palette
+// chunks 0x0004 and 0x0011. rgb converts the three stored components into a
+// color. Truncated chunks and out-of-range indices are ignored instead of
+// panicking.
+func (f *file) parseOldPalette(raw []byte, rgb func(r, g, b byte) color.NRGBA) {
+	if len(raw) < 2 {
+		return
+	}
+	packets := int(binary.LittleEndian.Uint16(raw))
+	raw = raw[2:]
+
+	currentIndex := 0
+
+	for i := 0; i < packets; i++ {
+		if len(raw) < 2 {
+			return
+		}
+
+		currentIndex += int(raw[0])
+
+		n := int(raw[1])
+		if n == 0 {
+			n = 256
+		}
+		raw = raw[2:]
+
+		for j := 0; j < n; j++ {
+			if len(raw) < 3 {
+				return
+			}
+			if currentIndex < len(f.palette) {
+				f.palette[currentIndex] = rgb(raw[0], raw[1], raw[2])
+			}
+			raw = raw[3:]
+			currentIndex++
 		}
 	}
 }
 
 // https://github.com/aseprite/aseprite/blob/main/docs/ase-file-specs.md#old-palette-chunk-0x0011
 func (f *file) parseChunk0011(raw []byte) {
-	packets := binary.LittleEndian.Uint16(raw)
-	raw = raw[2:]
-
-	currentIndex := 0
-
-	for i := 0; i < int(packets); i++ {
-		skip := int(raw[0])
-		currentIndex += skip
-
-		n := int(raw[1])
-		if n == 0 {
-			n = 256
-		}
-		raw = raw[2:]
-
-		for j := 0; j < n && currentIndex < len(f.palette); j++ {
-			f.palette[currentIndex] = color.NRGBA{
-				R: raw[0] * 4,
-				G: raw[1] * 4,
-				B: raw[2] * 4,
-				A: 255,
-			}
-			raw = raw[3:]
-			currentIndex++
-		}
-	}
+	// Components are stored in 6 bits and scaled back to 8 bits.
+	f.parseOldPalette(raw, func(r, g, b byte) color.NRGBA {
+		return color.NRGBA{R: r * 4, G: g * 4, B: b * 4, A: 255}
+	})
 }
 
 // https://github.com/aseprite/aseprite/blob/main/docs/ase-file-specs.md#old-palette-chunk-0x0004
 func (f *file) parseChunk0004(raw []byte) {
-	packets := binary.LittleEndian.Uint16(raw)
-	raw = raw[2:]
-
-	currentIndex := 0
-
-	for i := 0; i < int(packets); i++ {
-		skip := int(raw[0])
-		currentIndex += skip
-
-		n := int(raw[1])
-		if n == 0 {
-			n = 256
-		}
-		raw = raw[2:]
-
-		for j := 0; j < n && currentIndex < len(f.palette); j++ {
-			f.palette[currentIndex] = color.NRGBA{
-				R: raw[0],
-				G: raw[1],
-				B: raw[2],
-				A: 255,
-			}
-			raw = raw[3:]
-			currentIndex++
-		}
-	}
+	f.parseOldPalette(raw, func(r, g, b byte) color.NRGBA {
+		return color.NRGBA{R: r, G: g, B: b, A: 255}
+	})
 }
 
 func (f *file) initPalette() {
@@ -149,7 +184,7 @@ func (f *file) initPalette() {
 		}
 	}
 
-	if f.flags&1 != 0 {
+	if f.flags&1 != 0 && int(f.transparent) < len(f.palette) {
 		f.palette[f.transparent] = color.Transparent
 	}
 }
@@ -182,11 +217,18 @@ func (f *file) initLayers() error {
 }
 
 func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
-	layer := binary.LittleEndian.Uint16(raw)
+	if len(raw) < 16 {
+		return nil, formatError("cel chunk: truncated")
+	}
+	layer := int(binary.LittleEndian.Uint16(raw))
 	xpos := int(binary.LittleEndian.Uint16(raw[2:]))
 	ypos := int(binary.LittleEndian.Uint16(raw[4:]))
 	opacity := raw[6]
 	celtype := binary.LittleEndian.Uint16(raw[7:])
+
+	if layer >= len(f.layers) {
+		return nil, formatError("cel references layer %d of %d", layer, len(f.layers))
+	}
 
 	// invisible layer
 	if f.layers[layer].flags&1 == 0 {
@@ -204,27 +246,52 @@ func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
 
 	switch celtype {
 	case 0: // uncompressed image
+		if len(raw) < 4 {
+			return nil, formatError("uncompressed cel: truncated header")
+		}
 		width := int(binary.LittleEndian.Uint16(raw))
 		height := int(binary.LittleEndian.Uint16(raw[2:]))
-		pix := raw[4:]
+		if size := width * height * int(f.bpp) / 8; len(raw)-4 < size {
+			return nil, formatError("uncompressed cel: %d pixel bytes, chunk holds %d", size, len(raw)-4)
+		}
+		pix := raw[4 : 4+width*height*int(f.bpp)/8]
 		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
 		cel := f.makeCel(f, bounds, opacity, pix)
 		f.frames[frame].cels[layer] = cel
 	case 1: // linked cel
+		if len(raw) < 2 {
+			return nil, formatError("linked cel: truncated")
+		}
 		srcFrame := int(binary.LittleEndian.Uint16(raw))
-		srcCel := f.frames[srcFrame].cels[layer]
-		f.frames[frame].cels[layer] = srcCel
+		if srcFrame >= len(f.frames) {
+			return nil, formatError("linked cel references frame %d of %d", srcFrame, len(f.frames))
+		}
+		// Frames are parsed in order. A forward reference is not resolvable
+		// yet; leave this cel empty (fully transparent), which is how the
+		// decoder has always treated it, rather than rejecting the file.
+		if srcFrame < frame {
+			f.frames[frame].cels[layer] = f.frames[srcFrame].cels[layer]
+		}
 	case 2: // compressed image
+		if len(raw) < 4 {
+			return nil, formatError("compressed cel: truncated header")
+		}
 		width := int(binary.LittleEndian.Uint16(raw))
 		height := int(binary.LittleEndian.Uint16(raw[2:]))
 		zr, err := zlib.NewReader(bytes.NewReader(raw[4:]))
 		if err != nil {
-			return nil, err
+			return nil, formatError("compressed cel: %v", err)
 		}
-		pix, err := io.ReadAll(zr)
+		want := width * height * int(f.bpp) / 8
+		pix, err := io.ReadAll(io.LimitReader(zr, int64(want)+1))
+		zr.Close()
 		if err != nil {
-			return nil, err
+			return nil, formatError("compressed cel: %v", err)
 		}
+		if len(pix) < want {
+			return nil, formatError("compressed cel: decoded %d of %d pixel bytes", len(pix), want)
+		}
+		pix = pix[:want]
 		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
 		cel := f.makeCel(f, bounds, opacity, pix)
 		f.frames[frame].cels[layer] = cel
@@ -257,19 +324,32 @@ func (f *file) initCels() error {
 }
 
 func parseTag(t *Tag, raw []byte) []byte {
+	if len(raw) < 19 {
+		return nil
+	}
 	t.Lo = binary.LittleEndian.Uint16(raw)
 	t.Hi = binary.LittleEndian.Uint16(raw[2:])
 	t.LoopDirection = LoopDirection(raw[4])
 	t.Repeat = binary.LittleEndian.Uint16(raw[5:])
 	t.Name = parseString(raw[17:])
-	return raw[19+len(t.Name):]
+	adv := 19 + len(t.Name)
+	if adv > len(raw) {
+		adv = len(raw)
+	}
+	return raw[adv:]
 }
 
 func (f *file) buildTags() []Tag {
 	for _, chunk := range f.frames[0].chunks {
 		if chunk.typ == 0x2018 {
 			raw := chunk.raw
-			ntags := binary.LittleEndian.Uint16(raw)
+			if len(raw) < 10 {
+				return nil
+			}
+			ntags := int(binary.LittleEndian.Uint16(raw))
+			if n := (len(raw) - 10) / 19; ntags > n {
+				ntags = n
+			}
 			tags := make([]Tag, ntags)
 			raw = raw[10:]
 			for i := range tags {
@@ -283,6 +363,9 @@ func (f *file) buildTags() []Tag {
 }
 
 func parseSlice(s *Slice, flags uint32, raw []byte) []byte {
+	if len(raw) < 20 {
+		return nil
+	}
 	// framenum := binary.LittleEndian.Uint32(raw)
 	x := int32(binary.LittleEndian.Uint32(raw[4:]))
 	y := int32(binary.LittleEndian.Uint32(raw[8:]))
@@ -294,6 +377,9 @@ func parseSlice(s *Slice, flags uint32, raw []byte) []byte {
 	var cw, ch uint32
 
 	if flags&1 != 0 {
+		if len(raw) < 16 {
+			return nil
+		}
 		cx = int32(binary.LittleEndian.Uint32(raw))
 		cy = int32(binary.LittleEndian.Uint32(raw[4:]))
 		cw = binary.LittleEndian.Uint32(raw[8:])
@@ -304,6 +390,9 @@ func parseSlice(s *Slice, flags uint32, raw []byte) []byte {
 	var px, py int32
 
 	if flags&2 != 0 {
+		if len(raw) < 8 {
+			return nil
+		}
 		px = int32(binary.LittleEndian.Uint32(raw))
 		py = int32(binary.LittleEndian.Uint32(raw[4:]))
 		raw = raw[8:]
@@ -322,7 +411,13 @@ func (f *file) buildSlices() (slices []Slice) {
 		if chunk.typ == 0x2022 {
 			ofs := len(slices)
 			raw := chunk.raw
+			if len(raw) < 12 {
+				continue
+			}
 			nslices := int(binary.LittleEndian.Uint32(raw))
+			if n := (len(raw) - 12) / 20; nslices > n {
+				nslices = n
+			}
 			flags := binary.LittleEndian.Uint32(raw[4:])
 			name := parseString(raw[12:])
 
@@ -331,7 +426,9 @@ func (f *file) buildSlices() (slices []Slice) {
 			for i := 0; len(raw) > 0 && i < nslices; i++ {
 				var s Slice
 				s.Name = name
-				raw = parseSlice(&s, flags, raw)
+				if raw = parseSlice(&s, flags, raw); raw == nil {
+					break
+				}
 				slices = append(slices, s)
 			}
 

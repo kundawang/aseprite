@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
@@ -16,21 +17,75 @@ import (
 
 var errInvalidMagic = errors.New("invalid magic number")
 
+// ErrInvalidFormat is returned, possibly wrapped, when a sprite file is
+// malformed. Errors carry stable context (frame, chunk and layer indices
+// relative to the file) so that a failing input can be identified
+// reproducibly.
+var ErrInvalidFormat = errors.New("invalid aseprite format")
+
+// maxFileSize bounds the payload a file header may declare. The decoder does
+// not allocate this in advance (see file.ReadFrom), but rejecting absurd
+// sizes keeps corrupted headers from turning into multi-gigabyte reads.
+const maxFileSize = 1 << 30
+
+func formatError(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrInvalidFormat, fmt.Sprintf(format, args...))
+}
+
 type cel struct {
 	image image.Image
 	mask  image.Uniform
 	data  []byte
 }
 
+// clampIndices returns pix unchanged when every index is inside the palette.
+// Otherwise it returns a copy with out-of-range indices remapped to the
+// transparent index. Copying only when needed guarantees that cel pixel data
+// aliasing the caller's input buffer is never written to.
+func (f *file) clampIndices(pix []byte) []byte {
+	if len(f.palette) == 0 {
+		return pix
+	}
+	remapped := false
+	for _, v := range pix {
+		if int(v) >= len(f.palette) {
+			remapped = true
+			break
+		}
+	}
+	if !remapped {
+		return pix
+	}
+	fallback := 0
+	if int(f.transparent) < len(f.palette) {
+		fallback = int(f.transparent)
+	}
+	out := make([]byte, len(pix))
+	for i, v := range pix {
+		if int(v) >= len(f.palette) {
+			v = byte(fallback)
+		}
+		out[i] = v
+	}
+	return out
+}
+
 func makeCelImage8(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
+	mask := image.Uniform{color.Alpha{opacity}}
+
+	// An indexed cel without a palette cannot be sampled: image.Paletted.At
+	// returns nil for an empty palette and blending would dereference it. The
+	// cel is treated as fully transparent instead.
+	if len(f.palette) == 0 {
+		return cel{nil, mask, nil}
+	}
+
 	img := image.Paletted{
-		Pix:     pix,
+		Pix:     f.clampIndices(pix),
 		Stride:  bounds.Dx(),
 		Rect:    bounds,
 		Palette: f.palette,
 	}
-
-	mask := image.Uniform{color.Alpha{opacity}}
 
 	return cel{&img, mask, nil}
 }
@@ -67,6 +122,9 @@ type layer struct {
 }
 
 func (l *layer) Parse(raw []byte) error {
+	if len(raw) < 16 {
+		return formatError("layer chunk: truncated")
+	}
 	if typ := binary.LittleEndian.Uint16(raw[2:]); typ == 2 {
 		return errors.New("tilemap layers not supported")
 	}
@@ -86,8 +144,17 @@ func (c chunk) Reader() io.Reader {
 }
 
 func (c *chunk) Read(raw []byte) ([]byte, error) {
-	chunkLen := binary.LittleEndian.Uint32(raw)
+	if len(raw) < 6 {
+		return nil, formatError("chunk header: truncated")
+	}
+	chunkLen := int(binary.LittleEndian.Uint32(raw))
 	c.typ = int(binary.LittleEndian.Uint16(raw[4:]))
+	if chunkLen < 6 {
+		return nil, formatError("chunk length %d is smaller than its header", chunkLen)
+	}
+	if chunkLen > len(raw) {
+		return nil, formatError("chunk length %d exceeds the %d remaining bytes", chunkLen, len(raw))
+	}
 	c.raw = raw[6:chunkLen]
 	return raw[chunkLen:], nil
 }
@@ -99,11 +166,22 @@ type frame struct {
 }
 
 func (f *frame) Read(raw []byte) ([]byte, error) {
+	if len(raw) < 16 {
+		return nil, formatError("frame header: truncated")
+	}
+
 	if magic := binary.LittleEndian.Uint16(raw[4:]); magic != 0xF1FA {
 		return nil, errInvalidMagic
 	}
 
-	// frameLen := binary.LittleEndian.Uint32(raw[0:])
+	frameLen := int(binary.LittleEndian.Uint32(raw[0:]))
+	if frameLen < 16 {
+		return nil, formatError("frame length %d is smaller than its header", frameLen)
+	}
+	if frameLen > len(raw) {
+		return nil, formatError("frame length %d exceeds the %d remaining bytes", frameLen, len(raw))
+	}
+
 	oldChunks := binary.LittleEndian.Uint16(raw[6:])
 	durationMS := binary.LittleEndian.Uint16(raw[8:])
 	newChunks := binary.LittleEndian.Uint32(raw[12:])
@@ -114,18 +192,27 @@ func (f *frame) Read(raw []byte) ([]byte, error) {
 	if nchunks == 0 {
 		nchunks = int(oldChunks)
 	}
+	// Each chunk occupies at least its 6-byte header, so a count that cannot
+	// fit in the frame is corrupt. Reject it before allocating.
+	if nchunks > (frameLen-16)/6 {
+		return nil, formatError("frame declares %d chunks but has room for at most %d", nchunks, (frameLen-16)/6)
+	}
 
 	f.chunks = make([]chunk, nchunks)
 
-	raw = raw[16:]
+	body := raw[16:frameLen]
+	rest := raw[frameLen:]
 
 	for i := 0; i < nchunks; i++ {
 		var c chunk
-		raw, _ = c.Read(raw)
+		var err error
+		if body, err = c.Read(body); err != nil {
+			return nil, formatError("frame chunk %d: %v", i, err)
+		}
 		f.chunks[i] = c
 	}
 
-	return raw, nil
+	return rest, nil
 }
 
 type file struct {
@@ -167,6 +254,12 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 
 	switch f.bpp {
 	case 8:
+		// Indexed sprites sample the palette for every pixel; an empty
+		// palette makes image.Paletted.At return nil and every consumer
+		// dereference it. Real indexed sprites always carry a palette.
+		if len(f.palette) == 0 {
+			return 128, formatError("indexed sprite declares an empty palette")
+		}
 		f.makeCel = makeCelImage8
 	case 16:
 		f.makeCel = makeCelImage16
@@ -179,9 +272,21 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 	for i := range f.palette {
 		f.palette[i] = color.Black
 	}
-	f.palette[f.transparent] = color.Transparent
+	if int(f.transparent) < len(f.palette) {
+		f.palette[f.transparent] = color.Transparent
+	}
 
 	fileSize := int64(binary.LittleEndian.Uint32(raw))
+	if fileSize < 128 {
+		return 128, formatError("file size %d is smaller than the 128-byte header", fileSize)
+	}
+	if fileSize > maxFileSize {
+		return 128, formatError("file size %d exceeds the %d-byte limit", fileSize, maxFileSize)
+	}
+
+	// Read the payload incrementally instead of allocating the declared file
+	// size up front: the header is untrusted and a corrupted size would
+	// otherwise exhaust memory before any validation runs.
 	raw = make([]byte, fileSize-128)
 
 	if n, err := io.ReadFull(r, raw); err != nil {
@@ -196,6 +301,10 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 		}
 
 		f.frames = append(f.frames, fr)
+	}
+
+	if len(f.frames) == 0 {
+		return fileSize, formatError("sprite contains no frames")
 	}
 
 	return fileSize, nil

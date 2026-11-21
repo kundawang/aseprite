@@ -53,6 +53,38 @@ sprite, err := aseprite.Read(f)
 
 Read the [documentation](https://pkg.go.dev/github.com/askeladdk/aseprite) for more information about what meta data is extracted.
 
+## Deterministic decoding
+
+Decoding is a pure function of the input bytes. `Read`, `Decode` and
+`DecodeConfig`:
+
+- return byte-identical results across repeated and concurrent calls, for
+  pixels, frame bounds and durations, tags, slices and user data;
+- never write to the caller's input buffer, and never alias it from a
+  returned image or `[]byte`;
+- return an error instead of panicking on truncated or corrupt input, and
+  wrap structural errors in `aseprite.ErrInvalidFormat` with the frame, chunk
+  and layer indices that failed.
+
+This is enforced by `determinism_test.go`, `faultinject_test.go` and
+`public_api_test.go`. The tests decode a set of pinned binary fixtures in
+`testfiles/determinism` covering 8/16/32 bpp, linked cels, compressed cels,
+the old palette chunks (0x0004 and 0x0011), a non-zero transparent index, and
+empty metadata. To regenerate the fixtures:
+
+```
+go run cmd/genfixtures/main.go
+```
+
+The fixture files are pinned by SHA-256 in `determinism_test.go`, so an
+intentional regeneration must update the pins in the same change.
+
+Run the determinism suite with the race detector:
+
+```
+go test -race ./...
+```
+
 ## License
 
 Package aseprite is released under the terms of the ISC license.

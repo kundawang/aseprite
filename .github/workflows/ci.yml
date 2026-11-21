@@ -20,6 +20,11 @@ jobs:
         run: go install github.com/mattn/goveralls@latest
       - name: Run unit tests
         run: go test -race -covermode atomic -coverprofile=covprofile ./...
+      - name: Run deterministic decoder suite
+        # The determinism suite is where the input-immutability, concurrency
+        # and fault-injection guarantees are enforced; run it explicitly so a
+        # failure names the gate rather than showing up as a coverage drop.
+        run: go test -race -count=1 -run 'Deterministic|FaultInjection|RandomReadOrder|InputImmutable|ShareNoStorage|FixturesArePinned|RequiredFeatures|CoverageRecord|PeakMemory|CorruptInput|HeaderValidation|SuiteCoverage|RecordedScale|DecodeConfigMatchesDecode|ImageDecodeDeterministic' ./...
       - name: Send coverage
         env:
           COVERALLS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
