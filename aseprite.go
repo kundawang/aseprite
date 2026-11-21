@@ -19,7 +19,7 @@ import (
 type LoopDirection int
 
 const (
-	Forward LoopDirection = 0
+	Forward LoopDirection = iota
 	Reverse
 	PingPong
 	PingPongReverse
