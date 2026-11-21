@@ -138,6 +138,10 @@ type file struct {
 	frames      []frame
 	layers      []layer
 	makeCel     func(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel
+	registry    *Registry
+	strict      bool
+	fallback    Mode
+	diagnostics []Diagnostic
 }
 
 func (f *file) ReadFrom(r io.Reader) (int64, error) {
@@ -201,7 +205,7 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 	return fileSize, nil
 }
 
-func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
+func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle, err error) {
 	var atlasr image.Rectangle
 	atlasr, framesr = makeAtlasFrames(len(f.frames), f.framew, f.frameh)
 
@@ -232,9 +236,23 @@ func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 			sr := src.Bounds()
 			sp := sr.Min
 
-			if mode := f.layers[layer].blendMode; mode > 0 && int(mode) < len(blend.Modes) {
+			mode := Mode(f.layers[layer].blendMode)
+			info, ok := f.registry.Lookup(mode)
+			if !ok {
+				d := Diagnostic{Frame: i, Layer: layer, Mode: mode, Kind: kindFor(f.registry, mode)}
+				if f.strict {
+					return nil, nil, &UnsupportedModeError{d}
+				}
+				f.diagnostics = append(f.diagnostics, d)
+				info, _ = f.registry.Lookup(f.fallback)
+				mode = f.fallback
+			}
+
+			// Normal is composited straight with the opacity mask, without a
+			// pre-blend pass, preserving the original pixel result.
+			if mode != Normal {
 				draw.Draw(dstblend, framebounds, transparent, image.Point{}, draw.Src)
-				blend.Blend(dstblend, sr.Sub(sp), src, sp, dst, sp, blend.Modes[mode])
+				blend.Blend(dstblend, sr.Sub(sp), src, sp, dst, sp, info.Func)
 				src = dstblend
 				sp = image.Point{}
 			}

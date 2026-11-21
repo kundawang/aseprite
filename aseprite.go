@@ -100,14 +100,23 @@ type Aseprite struct {
 
 	// LayerData lists the user data of all visible layers.
 	LayerData [][]byte
+
+	// Diagnostics lists the unsupported blend modes that were encountered
+	// while decoding. It is only populated when decoding in fallback mode;
+	// strict decoding returns an UnsupportedModeError instead.
+	Diagnostics []Diagnostic
 }
 
-func (spr *Aseprite) readFrom(r io.Reader) error {
+func (spr *Aseprite) readFrom(r io.Reader, opts DecodeOptions) error {
 	var f file
 
 	if _, err := f.ReadFrom(r); err != nil {
 		return err
 	}
+
+	f.registry = opts.Registry
+	f.strict = opts.Strict
+	f.fallback = opts.Fallback
 
 	f.initPalette()
 
@@ -120,11 +129,16 @@ func (spr *Aseprite) readFrom(r io.Reader) error {
 	}
 
 	var framesr []image.Rectangle
-	spr.Image, framesr = f.buildAtlas()
+	var err error
+	spr.Image, framesr, err = f.buildAtlas()
+	if err != nil {
+		return err
+	}
 	userdata := f.buildUserData()
 	spr.Frames, userdata = f.buildFrames(framesr, userdata)
 	spr.LayerData = f.buildLayerData(userdata)
 	spr.Tags = f.buildTags()
 	spr.Slices = f.buildSlices()
+	spr.Diagnostics = f.diagnostics
 	return nil
 }

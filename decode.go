@@ -8,13 +8,19 @@ import (
 )
 
 // Decode reads a Aseprite image from r and returns it as an image.Image.
+//
+// Unsupported blend modes do not fail decoding: a Diagnostic is recorded on
+// the returned *Aseprite and the affected cel is composited with Normal. Use
+// DecodeWithOptions for strict failure handling or a custom Registry.
 func Decode(r io.Reader) (image.Image, error) {
-	var spr Aseprite
-	if err := spr.readFrom(r); err != nil {
+	spr, err := DecodeWithOptions(r, DecodeOptions{
+		Registry: DefaultRegistry(),
+		Fallback: Normal,
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	return &spr, nil
+	return spr, nil
 }
 
 // DecodeConfig returns the color model and dimensions of an Aseprite image
