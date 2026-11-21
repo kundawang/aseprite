@@ -95,16 +95,28 @@ type Aseprite struct {
 
 	// LayerData lists the user data of all visible layers.
 	LayerData [][]byte
+
+	// unknownChunks holds the audit trail of chunks the decoder ignored.
+	// Query it with UnknownChunks, UnknownChunkAt and the per-frame/type/
+	// layer helpers. The field is unexported so callers can only observe
+	// snapshots.
+	unknownChunks []UnknownChunk
 }
 
 func (spr *Aseprite) readFrom(r io.Reader) error {
+	return spr.readFromOptions(r, Options{})
+}
+
+func (spr *Aseprite) readFromOptions(r io.Reader, opts Options) error {
 	var f file
 
-	if _, err := f.ReadFrom(r); err != nil {
+	if _, err := f.ReadFromWithOptions(r, opts); err != nil {
 		return err
 	}
 
-	f.initPalette()
+	if err := f.initPalette(); err != nil {
+		return err
+	}
 
 	if err := f.initLayers(); err != nil {
 		return err
@@ -115,11 +127,26 @@ func (spr *Aseprite) readFrom(r io.Reader) error {
 	}
 
 	var framesr []image.Rectangle
-	spr.Image, framesr = f.buildAtlas()
+	var err error
+	spr.Image, framesr, err = f.buildAtlas()
+	if err != nil {
+		return err
+	}
 	userdata := f.buildUserData()
 	spr.Frames, userdata = f.buildFrames(framesr, userdata)
 	spr.LayerData = f.buildLayerData(userdata)
-	spr.Tags = f.buildTags()
-	spr.Slices = f.buildSlices()
+
+	tags, err := f.buildTags()
+	if err != nil {
+		return err
+	}
+	spr.Tags = tags
+
+	slices, err := f.buildSlices()
+	if err != nil {
+		return err
+	}
+	spr.Slices = slices
+	spr.unknownChunks = f.unknownChunks
 	return nil
 }
