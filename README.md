@@ -9,6 +9,8 @@ Package aseprite implements a decoder for [Aseprite sprite files](https://github
 
 Layers are flattened, blending modes are applied, and frames are arranged on a single texture atlas. Invisible and reference layers are ignored.
 
+Cels are stored at their original coordinates, including positions outside or partly beyond the canvas (negative coordinates included). When the atlas is built, each cel is clipped to the canvas rectangle, so only the visible part is drawn and frames never overlap. Cels that lie fully outside the canvas contribute nothing, and malformed cels (empty dimensions or truncated pixel data) are skipped rather than failing the decode.
+
 Limitations:
 - Tilemaps are not supported.
 - External files are not supported.

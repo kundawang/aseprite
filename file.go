@@ -230,6 +230,20 @@ func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 
 			src := c.image
 			sr := src.Bounds()
+
+			// Clip the cel to the canvas. Cels may extend beyond the
+			// canvas, including beyond its top-left corner, so the
+			// intersection can be empty or have a negative origin.
+			viewport := sr.Intersect(framebounds)
+			if viewport.Empty() {
+				continue
+			}
+
+			// Rebase the visible part of the cel onto an origin-zero
+			// sub-image. The cel image itself is never modified, so its
+			// original position and size are preserved.
+			src = subImage(src, viewport)
+			sr = src.Bounds()
 			sp := sr.Min
 
 			if mode := f.layers[layer].blendMode; mode > 0 && int(mode) < len(blend.Modes) {
@@ -246,6 +260,24 @@ func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 	}
 
 	return
+}
+
+// subImage returns the portion of img described by r, rebased onto a zero
+// origin. All concrete cel image types expose SubImage; the type switch
+// keeps the result an image.Image without assuming a concrete type.
+func subImage(img image.Image, r image.Rectangle) image.Image {
+	switch t := img.(type) {
+	case *image.NRGBA:
+		return t.SubImage(r)
+	case *image.Gray16:
+		return t.SubImage(r)
+	case *image.Paletted:
+		return t.SubImage(r)
+	case *image.RGBA:
+		return t.SubImage(r)
+	default:
+		return img
+	}
 }
 
 func (f *file) buildUserData() []byte {

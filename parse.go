@@ -104,8 +104,10 @@ func (f *file) initLayers() error {
 
 func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
 	layer := binary.LittleEndian.Uint16(raw)
-	xpos := int(binary.LittleEndian.Uint16(raw[2:]))
-	ypos := int(binary.LittleEndian.Uint16(raw[4:]))
+	// Cel position is a signed 16-bit coordinate and may point outside of
+	// the canvas, including negative coordinates.
+	xpos := int(int16(binary.LittleEndian.Uint16(raw[2:])))
+	ypos := int(int16(binary.LittleEndian.Uint16(raw[4:])))
 	opacity := raw[6]
 	celtype := binary.LittleEndian.Uint16(raw[7:])
 
@@ -125,33 +127,60 @@ func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
 
 	switch celtype {
 	case 0: // uncompressed image
-		width := int(binary.LittleEndian.Uint16(raw))
-		height := int(binary.LittleEndian.Uint16(raw[2:]))
-		pix := raw[4:]
-		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
-		cel := f.makeCel(f, bounds, opacity, pix)
-		f.frames[frame].cels[layer] = cel
+		return f.parseImageCel(frame, int(layer), xpos, ypos, opacity, raw, false)
 	case 1: // linked cel
 		srcFrame := int(binary.LittleEndian.Uint16(raw))
 		srcCel := f.frames[srcFrame].cels[layer]
 		f.frames[frame].cels[layer] = srcCel
 	case 2: // compressed image
-		width := int(binary.LittleEndian.Uint16(raw))
-		height := int(binary.LittleEndian.Uint16(raw[2:]))
-		zr, err := zlib.NewReader(bytes.NewReader(raw[4:]))
-		if err != nil {
-			return nil, err
-		}
-		pix, err := io.ReadAll(zr)
-		if err != nil {
-			return nil, err
-		}
-		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
-		cel := f.makeCel(f, bounds, opacity, pix)
-		f.frames[frame].cels[layer] = cel
+		return f.parseImageCel(frame, int(layer), xpos, ypos, opacity, raw, true)
 	default:
 		return nil, errors.New("unsupported cel type")
 	}
+
+	return &f.frames[frame].cels[layer], nil
+}
+
+// parseImageCel builds an image cel from raw chunk data. The cel keeps its
+// original position, which may be negative or outside of the canvas; cels
+// are clipped to the canvas when the atlas is built.
+//
+// Malformed cels that cannot be decoded (empty dimensions, a size overflow
+// or truncated pixel data) are skipped instead of panicking: the resulting
+// frame simply lacks that cel.
+func (f *file) parseImageCel(frame, layer, xpos, ypos int, opacity byte, raw []byte, compressed bool) (*cel, error) {
+	width := int(binary.LittleEndian.Uint16(raw))
+	height := int(binary.LittleEndian.Uint16(raw[2:]))
+
+	if width <= 0 || height <= 0 {
+		return nil, nil
+	}
+
+	pix := raw[4:]
+
+	if compressed {
+		zr, err := zlib.NewReader(bytes.NewReader(pix))
+		if err != nil {
+			return nil, err
+		}
+
+		if pix, err = io.ReadAll(zr); err != nil {
+			return nil, err
+		}
+	}
+
+	// Skip the cel rather than panic on an out-of-bounds index if the pixel
+	// data is truncated or claims more pixels than the chunk contains.
+	bpp := int(f.bpp) / 8
+	size := int64(width) * int64(height) * int64(bpp)
+	if size > int64(len(pix)) || size <= 0 {
+		return nil, nil
+	}
+
+	pix = pix[:size]
+	bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
+	c := f.makeCel(f, bounds, opacity, pix)
+	f.frames[frame].cels[layer] = c
 
 	return &f.frames[frame].cels[layer], nil
 }
