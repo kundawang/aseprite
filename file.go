@@ -201,17 +201,34 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 	return fileSize, nil
 }
 
-func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
-	var atlasr image.Rectangle
-	atlasr, framesr = makeAtlasFrames(len(f.frames), f.framew, f.frameh)
-
+func (f *file) newAtlasImage(r image.Rectangle) draw.Image {
 	switch f.bpp {
 	case 8:
-		atlas = image.NewPaletted(atlasr, f.palette)
+		return image.NewPaletted(r, f.palette)
 	case 16:
-		atlas = image.NewGray16(atlasr)
+		return image.NewGray16(r)
 	default:
-		atlas = image.NewRGBA(atlasr)
+		return image.NewRGBA(r)
+	}
+}
+
+func (f *file) buildAtlas(opts AtlasOptions) (pages []draw.Image, framesr []image.Rectangle, pageOf []int, err error) {
+	if opts.isZero() {
+		// Legacy single-atlas layout.
+		var atlasr image.Rectangle
+		atlasr, framesr = makeAtlasFrames(len(f.frames), f.framew, f.frameh)
+		pages = []draw.Image{f.newAtlasImage(atlasr)}
+		pageOf = make([]int, len(f.frames))
+	} else {
+		var pagerects []image.Rectangle
+		pagerects, framesr, pageOf, err = packFrames(len(f.frames), f.framew, f.frameh, opts)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		pages = make([]draw.Image, len(pagerects))
+		for i, r := range pagerects {
+			pages[i] = f.newAtlasImage(r)
+		}
 	}
 
 	framebounds := image.Rect(0, 0, f.framew, f.frameh)
@@ -252,7 +269,7 @@ func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 			draw.DrawMask(dst, sr, src, sp, &c.mask, image.Point{}, draw.Over)
 		}
 
-		draw.Draw(atlas, framesr[i], dst, image.Point{}, draw.Src)
+		draw.Draw(pages[pageOf[i]], framesr[i], dst, image.Point{}, draw.Src)
 	}
 
 	return
@@ -288,12 +305,13 @@ func (f *file) buildLayerData(userdata []byte) [][]byte {
 	return ld
 }
 
-func (f *file) buildFrames(framesr []image.Rectangle, userdata []byte) ([]Frame, []byte) {
+func (f *file) buildFrames(framesr []image.Rectangle, pageOf []int, userdata []byte) ([]Frame, []byte) {
 	frames := make([]Frame, len(f.frames))
 
 	for i, fr := range f.frames {
 		frames[i].Duration = fr.dur
 		frames[i].Bounds = framesr[i]
+		frames[i].Page = pageOf[i]
 		frames[i].Data = make([][]byte, 0, len(fr.cels))
 		for _, c := range fr.cels {
 			if nd := len(c.data); nd > 0 {

@@ -16,6 +16,21 @@ func Read(r io.Reader) (*Aseprite, error) {
 	return &spr, nil
 }
 
+// ReadWithOptions decodes an Aseprite image from r, packing frames into
+// atlas pages according to opts. Use it to respect texture size limits
+// (e.g. 1024x1024 on mobile GPUs) by splitting long animations over
+// multiple pages. It returns an error matching ErrFrameTooLarge,
+// ErrPaddingTooLarge, ErrTooManyPages, ErrAtlasOverflow or
+// ErrInvalidOptions when the frames cannot be packed as requested.
+func ReadWithOptions(r io.Reader, opts AtlasOptions) (*Aseprite, error) {
+	var spr Aseprite
+	if err := spr.readFromWithOptions(r, opts); err != nil {
+		return nil, err
+	}
+
+	return &spr, nil
+}
+
 // Decode decodes an Aseprite image from r and returns it as an image.Image.
 func Decode(r io.Reader) (image.Image, error) {
 	return Read(r)

@@ -45,8 +45,12 @@ type Tag struct {
 
 // Frame represents a single frame in the sprite.
 type Frame struct {
-	// Bounds is the image bounds of the frame in the sprite's atlas.
+	// Bounds is the image bounds of the frame in its atlas page.
 	Bounds image.Rectangle
+
+	// Page is the index of the atlas page (Aseprite.Pages) that holds
+	// the frame. It is always 0 for the default single-atlas layout.
+	Page int
 
 	// Duration is the time in seconds that the frame should be displayed for
 	// in a tag animation loop.
@@ -82,7 +86,13 @@ type Slice struct {
 type Aseprite struct {
 	// Image contains all frame images in a single image.
 	// Frame bounds specify where the frame images are located.
+	// It is the first atlas page, i.e. the same image as Pages[0].
 	image.Image
+
+	// Pages lists all atlas pages. The default layout produces a single
+	// page; ReadWithOptions may produce several. Frame.Page selects the
+	// page a frame is drawn on, Frame.Bounds its location within it.
+	Pages []image.Image
 
 	// Frames lists all frames that make up the sprite.
 	Frames []Frame
@@ -98,6 +108,10 @@ type Aseprite struct {
 }
 
 func (spr *Aseprite) readFrom(r io.Reader) error {
+	return spr.readFromWithOptions(r, AtlasOptions{})
+}
+
+func (spr *Aseprite) readFromWithOptions(r io.Reader, opts AtlasOptions) error {
 	var f file
 
 	if _, err := f.ReadFrom(r); err != nil {
@@ -114,10 +128,19 @@ func (spr *Aseprite) readFrom(r io.Reader) error {
 		return err
 	}
 
-	var framesr []image.Rectangle
-	spr.Image, framesr = f.buildAtlas()
+	pages, framesr, pageOf, err := f.buildAtlas(opts)
+	if err != nil {
+		return err
+	}
+
+	spr.Pages = make([]image.Image, len(pages))
+	for i, page := range pages {
+		spr.Pages[i] = page
+	}
+	spr.Image = pages[0]
+
 	userdata := f.buildUserData()
-	spr.Frames, userdata = f.buildFrames(framesr, userdata)
+	spr.Frames, userdata = f.buildFrames(framesr, pageOf, userdata)
 	spr.LayerData = f.buildLayerData(userdata)
 	spr.Tags = f.buildTags()
 	spr.Slices = f.buildSlices()
