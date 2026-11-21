@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
@@ -68,19 +69,30 @@ func makeCelImage32(f *file, bounds image.Rectangle, opacity byte, pix []byte) c
 }
 
 type layer struct {
-	flags     uint16
-	blendMode uint16
-	opacity   byte
-	data      []byte
+	name       string
+	typ        uint16
+	flags      uint16
+	childLevel uint16
+	blendMode  uint16
+	opacity    byte
+	data       []byte
 }
 
 func (l *layer) Parse(raw []byte) error {
-	if typ := binary.LittleEndian.Uint16(raw[2:]); typ == 2 {
+	typ := binary.LittleEndian.Uint16(raw[2:])
+	switch typ {
+	case 0, 1: // normal, group
+	case 2:
 		return errors.New("tilemap layers not supported")
+	default:
+		return fmt.Errorf("unknown layer type %d", typ)
 	}
+	l.typ = typ
 	l.flags = binary.LittleEndian.Uint16(raw)
+	l.childLevel = binary.LittleEndian.Uint16(raw[4:])
 	l.blendMode = binary.LittleEndian.Uint16(raw[10:])
 	l.opacity = raw[12]
+	l.name = parseString(raw[16:])
 	return nil
 }
 
@@ -209,6 +221,25 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 	return fileSize, nil
 }
 
+var transparentUniform = &image.Uniform{color.Transparent}
+
+// blendDraw draws src onto dst through mask. If mode is a supported
+// non-normal blend mode, src is first blended with the current contents
+// of dst into scratch, which must have the same bounds as dst.
+func blendDraw(dst, scratch draw.Image, src image.Image, mask image.Image, mode uint16) {
+	sr := src.Bounds()
+	sp := sr.Min
+
+	if mode > 0 && int(mode) < len(blend.Modes) {
+		draw.Draw(scratch, dst.Bounds(), transparentUniform, image.Point{}, draw.Src)
+		blend.Blend(scratch, sr.Sub(sp), src, sp, dst, sp, blend.Modes[mode])
+		src = scratch
+		sp = image.Point{}
+	}
+
+	draw.DrawMask(dst, sr, src, sp, mask, image.Point{}, draw.Over)
+}
+
 func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 	var atlasr image.Rectangle
 	atlasr, framesr = makeAtlasFrames(len(f.frames), f.framew, f.frameh)
@@ -224,33 +255,62 @@ func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 	dstblend := image.NewRGBA(framebounds)
 	dst := image.NewRGBA(framebounds)
 
-	transparent := &image.Uniform{color.Transparent}
-
 	for i, fr := range f.frames {
-		draw.Draw(dst, framebounds, transparent, image.Point{}, draw.Src)
+		draw.Draw(dst, framebounds, transparentUniform, image.Point{}, draw.Src)
 		for layer, c := range fr.cels {
 			if c.image == nil {
 				continue
 			}
 
-			src := c.image
-			sr := src.Bounds()
-			sp := sr.Min
-
-			if mode := f.layers[layer].blendMode; mode > 0 && int(mode) < len(blend.Modes) {
-				draw.Draw(dstblend, framebounds, transparent, image.Point{}, draw.Src)
-				blend.Blend(dstblend, sr.Sub(sp), src, sp, dst, sp, blend.Modes[mode])
-				src = dstblend
-				sp = image.Point{}
-			}
-
-			draw.DrawMask(dst, sr, src, sp, c.mask, image.Point{}, draw.Over)
+			blendDraw(dst, dstblend, c.image, c.mask, f.layers[layer].blendMode)
 		}
 
 		draw.Draw(atlas, framesr[i], dst, image.Point{}, draw.Src)
 	}
 
 	return
+}
+
+// composeNode draws node and its subtree for the given frame onto dst.
+// A nil include draws all visible, non-reference layers; otherwise include
+// fully decides which nodes are drawn. Group subtrees are composited into
+// a temporary image first so that the group's own opacity and blend mode
+// apply to the composited result, as the file format specifies.
+func (f *file) composeNode(dst, scratch draw.Image, bounds image.Rectangle, fr *frame, node *Layer, include func(*Layer) bool, depth int) error {
+	// A tree built by buildLayerTree cannot cycle, but guard against
+	// hand-built or corrupted trees instead of recursing forever.
+	if depth > len(f.layers) {
+		return fmt.Errorf("aseprite: layer %q: %w", node.Name, ErrLayerTreeCycle)
+	}
+
+	if include != nil {
+		if !include(node) {
+			return nil
+		}
+	} else if !node.Visible || node.Reference {
+		return nil
+	}
+
+	if node.Group {
+		// An empty group composits to a fully transparent image,
+		// which is a no-op when drawn.
+		tmp := image.NewRGBA(bounds)
+		for _, child := range node.Children {
+			if err := f.composeNode(tmp, scratch, bounds, fr, child, include, depth+1); err != nil {
+				return err
+			}
+		}
+		blendDraw(dst, scratch, tmp, &opacityMasks[node.Opacity], node.BlendMode)
+		return nil
+	}
+
+	if node.Index < len(fr.cels) {
+		if c := fr.cels[node.Index]; c.image != nil {
+			blendDraw(dst, scratch, c.image, c.mask, node.BlendMode)
+		}
+	}
+
+	return nil
 }
 
 func (f *file) buildUserData() []byte {
