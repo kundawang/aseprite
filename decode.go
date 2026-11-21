@@ -6,10 +6,32 @@ import (
 	"io"
 )
 
+// Options configures how layers are composited during decoding.
+// The zero value reproduces the historical gamma-encoded compositing
+// bit-for-bit.
+type Options struct {
+	// LinearLight blends and composites layers in linearized sRGB space
+	// instead of gamma-encoded sRGB space. Semi-transparent bright layers
+	// over dark backgrounds come out brighter, matching how the layers
+	// would blend physically. Alpha is always treated as linear.
+	LinearLight bool
+
+	// PremultipliedAlpha treats layer colors as alpha-premultiplied when
+	// blending: blend modes are applied to the premultiplied channels
+	// as-is. Otherwise colors are treated as straight (non-premultiplied)
+	// alpha and un-premultiplied before blending.
+	PremultipliedAlpha bool
+}
+
 // DecodeAseprite decodes an Aseprite image from r.
 func DecodeAseprite(r io.Reader) (*Aseprite, error) {
+	return DecodeAsepriteWithOptions(r, Options{})
+}
+
+// DecodeAsepriteWithOptions decodes an Aseprite image from r using opts.
+func DecodeAsepriteWithOptions(r io.Reader, opts Options) (*Aseprite, error) {
 	var spr Aseprite
-	if err := spr.readFrom(r); err != nil {
+	if err := spr.readFrom(r, opts); err != nil {
 		return nil, err
 	}
 

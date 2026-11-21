@@ -17,9 +17,10 @@ import (
 var errInvalidMagic = errors.New("invalid magic number")
 
 type cel struct {
-	image image.Image
-	mask  image.Uniform
-	data  []byte
+	image   image.Image
+	mask    image.Uniform
+	opacity byte
+	data    []byte
 }
 
 func makeCelImage8(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
@@ -32,7 +33,7 @@ func makeCelImage8(f *file, bounds image.Rectangle, opacity byte, pix []byte) ce
 
 	mask := image.Uniform{color.Alpha{opacity}}
 
-	return cel{&img, mask, nil}
+	return cel{&img, mask, opacity, nil}
 }
 
 func makeCelImage16(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
@@ -44,7 +45,7 @@ func makeCelImage16(f *file, bounds image.Rectangle, opacity byte, pix []byte) c
 
 	mask := image.Uniform{color.Alpha{opacity}}
 
-	return cel{&img, mask, nil}
+	return cel{&img, mask, opacity, nil}
 }
 
 func makeCelImage32(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
@@ -56,7 +57,7 @@ func makeCelImage32(f *file, bounds image.Rectangle, opacity byte, pix []byte) c
 
 	mask := image.Uniform{color.Alpha{opacity}}
 
-	return cel{&img, mask, nil}
+	return cel{&img, mask, opacity, nil}
 }
 
 type layer struct {
@@ -137,6 +138,7 @@ type file struct {
 	palette     color.Palette
 	frames      []frame
 	layers      []layer
+	opts        Options
 	makeCel     func(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel
 }
 
@@ -216,10 +218,23 @@ func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 
 	framebounds := image.Rect(0, 0, f.framew, f.frameh)
 
-	dstblend := image.NewRGBA(framebounds)
 	dst := image.NewRGBA(framebounds)
 
 	transparent := &image.Uniform{color.Transparent}
+
+	// The single-pass compositor handles blending, opacity and source-over
+	// in one go. The zero Options value keeps the legacy two-pass pipeline
+	// so that default decoding results are bit-identical to before.
+	composite := f.opts.LinearLight || f.opts.PremultipliedAlpha
+	bopts := blend.Options{
+		LinearLight:   f.opts.LinearLight,
+		Premultiplied: f.opts.PremultipliedAlpha,
+	}
+
+	var dstblend *image.RGBA
+	if !composite {
+		dstblend = image.NewRGBA(framebounds)
+	}
 
 	for i, fr := range f.frames {
 		draw.Draw(dst, framebounds, transparent, image.Point{}, draw.Src)
@@ -231,6 +246,12 @@ func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 			src := c.image
 			sr := src.Bounds()
 			sp := sr.Min
+
+			if composite {
+				blend.Composite(dst, sr.Sub(sp), src, sp, dst, sp,
+					int(f.layers[layer].blendMode), c.opacity, bopts)
+				continue
+			}
 
 			if mode := f.layers[layer].blendMode; mode > 0 && int(mode) < len(blend.Modes) {
 				draw.Draw(dstblend, framebounds, transparent, image.Point{}, draw.Src)

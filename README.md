@@ -42,6 +42,19 @@ if imgformat == "aseprite" {
 
 Read the [documentation](https://pkg.go.dev/github.com/askeladdk/aseprite) for more information about what meta data is extracted.
 
+## Linear-light compositing
+
+By default, layers are blended and composited in gamma-encoded sRGB space, reproducing the historical output bit-for-bit. `DecodeAsepriteWithOptions` can instead composite in linearized sRGB, which keeps semi-transparent bright layers (glows, lights) over dark backgrounds from coming out darker than intended:
+
+```go
+spr, err := aseprite.DecodeAsepriteWithOptions(r, aseprite.Options{
+    LinearLight: true, // blend in linearized sRGB instead of gamma-encoded sRGB
+    // PremultipliedAlpha: true, // treat colors as alpha-premultiplied
+})
+```
+
+Blending, layer opacity and source-over compositing happen in a single pass, so layer opacity is applied exactly once. Out-of-range blend results (e.g. from Addition or Divide) are clamped deterministically.
+
 ## License
 
 Package aseprite is released under the terms of the ISC license.

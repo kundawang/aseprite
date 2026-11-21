@@ -97,8 +97,9 @@ type Aseprite struct {
 	LayerData [][]byte
 }
 
-func (spr *Aseprite) readFrom(r io.Reader) error {
+func (spr *Aseprite) readFrom(r io.Reader, opts Options) error {
 	var f file
+	f.opts = opts
 
 	if _, err := f.ReadFrom(r); err != nil {
 		return err
