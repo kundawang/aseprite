@@ -2,13 +2,16 @@ package aseprite
 
 import (
 	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"io"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"github.com/askeladdk/aseprite/internal/blend"
@@ -28,6 +31,63 @@ type cel struct {
 	image image.Image
 	mask  image.Image
 	data  []byte
+
+	// The fields below describe a compressed cel whose pixel data has not
+	// been decompressed yet. They are only used in frame mode (deferCels).
+	pix        []byte
+	bounds     image.Rectangle
+	opacity    byte
+	compressed bool
+
+	// linked marks a cel that has not been resolved yet. Linked cels are
+	// resolved after all frames have been parsed, so that links may refer
+	// to frames in any order without panicking on partially parsed data.
+	linked    bool
+	linkFrame int
+}
+
+// resolve returns the cel with its image available, decompressing the pixel
+// data on demand in frame mode. The returned cel is only valid for the
+// duration of the frame composition; it is not written back, so releasing a
+// frame image also releases the decompressed pixels. The opacity mask is
+// preserved so that cel opacity is applied exactly as in atlas mode.
+func (c *cel) resolve(f *file) (cel, error) {
+	if !c.compressed {
+		return *c, nil
+	}
+
+	if c.bounds.Empty() {
+		return cel{}, nil
+	}
+
+	if len(c.pix) == 0 {
+		return cel{}, fmt.Errorf("aseprite: cel at %v has no pixel data", c.bounds)
+	}
+
+	zr, err := zlib.NewReader(bytes.NewReader(c.pix))
+	if err != nil {
+		return cel{}, err
+	}
+	defer zr.Close()
+
+	pix, err := io.ReadAll(zr)
+	if err != nil {
+		return cel{}, err
+	}
+
+	f.decompressCount.Add(1)
+
+	n := c.bounds.Dx() * c.bounds.Dy() * int(f.bpp) / 8
+	if len(pix) < n {
+		return cel{}, fmt.Errorf("aseprite: cel at %v has %d bytes of pixel data, expected %d", c.bounds, len(pix), n)
+	}
+
+	return f.makeCel(f, c.bounds, c.opacity, pix[:n]), nil
+}
+
+// present reports whether the cel has any image to draw.
+func (c *cel) present() bool {
+	return c.image != nil || c.compressed
 }
 
 func makeCelImage8(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
@@ -40,7 +100,7 @@ func makeCelImage8(f *file, bounds image.Rectangle, opacity byte, pix []byte) ce
 
 	mask := &opacityMasks[opacity]
 
-	return cel{&img, mask, nil}
+	return cel{image: &img, mask: mask}
 }
 
 func makeCelImage16(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
@@ -52,7 +112,7 @@ func makeCelImage16(f *file, bounds image.Rectangle, opacity byte, pix []byte) c
 
 	mask := &opacityMasks[opacity]
 
-	return cel{&img, mask, nil}
+	return cel{image: &img, mask: mask}
 }
 
 func makeCelImage32(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel {
@@ -64,7 +124,7 @@ func makeCelImage32(f *file, bounds image.Rectangle, opacity byte, pix []byte) c
 
 	mask := &opacityMasks[opacity]
 
-	return cel{&img, mask, nil}
+	return cel{image: &img, mask: mask}
 }
 
 type layer struct {
@@ -146,6 +206,16 @@ type file struct {
 	frames      []frame
 	layers      []layer
 	makeCel     func(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel
+
+	// deferCels defers decompression of compressed cel pixel data until a
+	// frame is rendered. Frame mode uses it so that reading a sprite does
+	// not decode the entire animation up front.
+	deferCels bool
+
+	// decompressCount counts compressed cels decompressed on demand. It is
+	// only used by tests to prove that frame access decodes one frame at a
+	// time.
+	decompressCount atomic.Int64
 }
 
 func (f *file) ReadFrom(r io.Reader) (int64, error) {
@@ -209,7 +279,7 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 	return fileSize, nil
 }
 
-func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
+func (f *file) buildAtlas() (atlas image.Image, framesr []image.Rectangle, err error) {
 	var atlasr image.Rectangle
 	atlasr, framesr = makeAtlasFrames(len(f.frames), f.framew, f.frameh)
 
@@ -219,38 +289,90 @@ func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 		atlas = image.NewRGBA(atlasr)
 	}
 
+	dstAtlas := atlas.(draw.Image)
+
 	framebounds := image.Rect(0, 0, f.framew, f.frameh)
 
 	dstblend := image.NewRGBA(framebounds)
 	dst := image.NewRGBA(framebounds)
 
-	transparent := &image.Uniform{color.Transparent}
+	for i := range f.frames {
+		draw.Draw(dst, framebounds, image.Transparent, image.Point{}, draw.Src)
 
-	for i, fr := range f.frames {
-		draw.Draw(dst, framebounds, transparent, image.Point{}, draw.Src)
-		for layer, c := range fr.cels {
-			if c.image == nil {
-				continue
-			}
-
-			src := c.image
-			sr := src.Bounds()
-			sp := sr.Min
-
-			if mode := f.layers[layer].blendMode; mode > 0 && int(mode) < len(blend.Modes) {
-				draw.Draw(dstblend, framebounds, transparent, image.Point{}, draw.Src)
-				blend.Blend(dstblend, sr.Sub(sp), src, sp, dst, sp, blend.Modes[mode])
-				src = dstblend
-				sp = image.Point{}
-			}
-
-			draw.DrawMask(dst, sr, src, sp, c.mask, image.Point{}, draw.Over)
+		if err = f.composeFrame(i, dst, dstblend); err != nil {
+			return nil, nil, err
 		}
 
-		draw.Draw(atlas, framesr[i], dst, image.Point{}, draw.Src)
+		draw.Draw(dstAtlas, framesr[i], dst, image.Point{}, draw.Src)
 	}
 
-	return
+	return atlas, framesr, nil
+}
+
+// buildFrameImage renders frame i into its own image, anchored at the origin
+// of an image.Rect(0, 0, framew, frameh) canvas. Each call allocates fresh
+// pixel storage, so the result is independent of the atlas and of previously
+// built frame images.
+//
+// Composition always happens in RGBA, exactly as for the atlas, so that the
+// per-frame and atlas pixels agree bit for bit. For 16 bpp the RGBA result is
+// then converted to Gray16, matching the atlas color model.
+func (f *file) buildFrameImage(i int) (image.Image, error) {
+	framebounds := image.Rect(0, 0, f.framew, f.frameh)
+	dst := image.NewRGBA(framebounds)
+	dstblend := image.NewRGBA(framebounds)
+
+	if err := f.composeFrame(i, dst, dstblend); err != nil {
+		return nil, err
+	}
+
+	if f.bpp == 16 {
+		gray := image.NewGray16(framebounds)
+		draw.Draw(gray, framebounds, dst, image.Point{}, draw.Src)
+		return gray, nil
+	}
+
+	return dst, nil
+}
+
+// composeFrame flattens the cels of frame i into dst, a canvas with bounds
+// image.Rect(0, 0, framew, frameh).
+func (f *file) composeFrame(i int, dst draw.Image, dstblend *image.RGBA) error {
+	framebounds := dst.Bounds()
+	transparent := image.Transparent
+
+	for layer, c := range f.frames[i].cels {
+		if !c.present() {
+			continue
+		}
+
+		// Resolve the cel image before it is used. In atlas mode this is
+		// the image parsed up front; in frame mode compressed pixels are
+		// decompressed here.
+		rc, err := c.resolve(f)
+		if err != nil {
+			return err
+		}
+
+		if rc.image == nil {
+			continue
+		}
+
+		src := rc.image
+		sr := src.Bounds()
+		sp := sr.Min
+
+		if mode := f.layers[layer].blendMode; mode > 0 && int(mode) < len(blend.Modes) {
+			draw.Draw(dstblend, framebounds, transparent, image.Point{}, draw.Src)
+			blend.Blend(dstblend, sr.Sub(sp), src, sp, dst, sp, blend.Modes[mode])
+			src = dstblend
+			sp = image.Point{}
+		}
+
+		draw.DrawMask(dst, sr, src, sp, rc.mask, image.Point{}, draw.Over)
+	}
+
+	return nil
 }
 
 func (f *file) buildUserData() []byte {

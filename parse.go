@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"io"
@@ -103,11 +104,19 @@ func (f *file) initLayers() error {
 }
 
 func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
-	layer := binary.LittleEndian.Uint16(raw)
+	if len(raw) < 16 {
+		return nil, fmt.Errorf("aseprite: frame %d: cel chunk too short (%d bytes)", frame, len(raw))
+	}
+
+	layer := int(binary.LittleEndian.Uint16(raw))
 	xpos := int(binary.LittleEndian.Uint16(raw[2:]))
 	ypos := int(binary.LittleEndian.Uint16(raw[4:]))
 	opacity := raw[6]
 	celtype := binary.LittleEndian.Uint16(raw[7:])
+
+	if layer < 0 || layer >= len(f.layers) {
+		return nil, fmt.Errorf("aseprite: frame %d: cel references layer %d, but the file has only %d layers", frame, layer, len(f.layers))
+	}
 
 	// invisible layer
 	if f.layers[layer].flags&1 == 0 {
@@ -125,19 +134,51 @@ func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
 
 	switch celtype {
 	case 0: // uncompressed image
+		if len(raw) < 4 {
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: image cel chunk too short (%d bytes)", frame, layer, len(raw))
+		}
 		width := int(binary.LittleEndian.Uint16(raw))
 		height := int(binary.LittleEndian.Uint16(raw[2:]))
 		pix := raw[4:]
 		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
+		if n := bounds.Dx() * bounds.Dy() * int(f.bpp) / 8; len(pix) < n {
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: cel has %d bytes of pixel data, expected %d", frame, layer, len(pix), n)
+		}
 		cel := f.makeCel(f, bounds, opacity, pix)
 		f.frames[frame].cels[layer] = cel
 	case 1: // linked cel
+		if len(raw) < 2 {
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: linked cel chunk too short (%d bytes)", frame, layer, len(raw))
+		}
 		srcFrame := int(binary.LittleEndian.Uint16(raw))
-		srcCel := f.frames[srcFrame].cels[layer]
-		f.frames[frame].cels[layer] = srcCel
+		// Resolve links after all frames have been parsed so that forward
+		// links work and cyclic links are reported instead of recursing
+		// forever.
+		f.frames[frame].cels[layer] = cel{
+			linked:    true,
+			linkFrame: srcFrame,
+		}
 	case 2: // compressed image
+		if len(raw) < 4 {
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: compressed cel chunk too short (%d bytes)", frame, layer, len(raw))
+		}
 		width := int(binary.LittleEndian.Uint16(raw))
 		height := int(binary.LittleEndian.Uint16(raw[2:]))
+		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
+
+		if f.deferCels {
+			// Do not decompress now. Keep a reference to the compressed
+			// bytes in the decoder's input buffer, which is already
+			// retained, and decompress only when the frame is rendered.
+			f.frames[frame].cels[layer] = cel{
+				pix:        raw[4:],
+				bounds:     bounds,
+				opacity:    opacity,
+				compressed: true,
+			}
+			break
+		}
+
 		zr, err := zlib.NewReader(bytes.NewReader(raw[4:]))
 		if err != nil {
 			return nil, err
@@ -146,7 +187,9 @@ func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
 		if err != nil {
 			return nil, err
 		}
-		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
+		if n := bounds.Dx() * bounds.Dy() * int(f.bpp) / 8; len(pix) < n {
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: cel has %d bytes of pixel data, expected %d", frame, layer, len(pix), n)
+		}
 		cel := f.makeCel(f, bounds, opacity, pix)
 		f.frames[frame].cels[layer] = cel
 	default:
@@ -154,6 +197,62 @@ func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
 	}
 
 	return &f.frames[frame].cels[layer], nil
+}
+
+// resolveLinkedCels replaces linked cels with their target cels once every
+// frame has been parsed. A link to an empty cel yields an empty cel, which
+// renders as a fully transparent frame. Out-of-range links and link cycles
+// are reported as errors.
+func (f *file) resolveLinkedCels() error {
+	for frame := range f.frames {
+		for layer := range f.frames[frame].cels {
+			if err := f.resolveLinkedCel(frame, layer); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (f *file) resolveLinkedCel(frame, layer int) error {
+	// Follow the chain iteratively and remember the frames on it so that a
+	// cycle can be detected without recursion over an attacker-controlled
+	// chain length.
+	chain := make(map[int]bool)
+
+	for {
+		c := &f.frames[frame].cels[layer]
+		if !c.linked {
+			break
+		}
+
+		if chain[frame] {
+			return fmt.Errorf("aseprite: frame %d layer %d: linked cel cycle", frame, layer)
+		}
+		chain[frame] = true
+
+		if c.linkFrame < 0 || c.linkFrame >= len(f.frames) {
+			return fmt.Errorf("aseprite: frame %d layer %d: linked cel references frame %d, but the file has only %d frames", frame, layer, c.linkFrame, len(f.frames))
+		}
+
+		frame = c.linkFrame
+	}
+
+	// frame now holds the resolved cel. Point every cel on the chain at a
+	// copy of it, preserving each link's own user data, as if the link had
+	// copied the source cel at parse time.
+	target := f.frames[frame].cels[layer]
+
+	for link := range chain {
+		c := &f.frames[link].cels[layer]
+		own := c.data
+		*c = target
+		if len(own) > 0 {
+			c.data = own
+		}
+	}
+
+	return nil
 }
 
 func (f *file) initCels() error {
@@ -174,7 +273,7 @@ func (f *file) initCels() error {
 		}
 	}
 
-	return nil
+	return f.resolveLinkedCels()
 }
 
 func parseTag(t *Tag, raw []byte) []byte {

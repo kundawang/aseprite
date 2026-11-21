@@ -25,7 +25,10 @@ func Decode(r io.Reader) (image.Image, error) {
 		return nil, err
 	}
 
-	atlas, _ := f.buildAtlas()
+	atlas, _, err := f.buildAtlas()
+	if err != nil {
+		return nil, err
+	}
 	return atlas, nil
 }
 
