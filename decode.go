@@ -2,58 +2,21 @@ package aseprite
 
 import (
 	"image"
-	"image/color"
 	"io"
 )
 
-// Read decodes an Aseprite image from r.
-func Read(r io.Reader) (*Aseprite, error) {
-	var spr Aseprite
-	if err := spr.readFrom(r); err != nil {
-		return nil, err
-	}
-
-	return &spr, nil
+// decode adapts the variadic, budget-aware Decode to the image.Format
+// signature. Registered formats always run without a budget.
+func decode(r io.Reader) (image.Image, error) {
+	return Decode(r)
 }
 
-// Decode decodes an Aseprite image from r and returns it as an image.Image.
-func Decode(r io.Reader) (image.Image, error) {
-	return Read(r)
-}
-
-// DecodeConfig returns the color model and dimensions of an Aseprite image
-// without decoding the entire image.
-func DecodeConfig(r io.Reader) (image.Config, error) {
-	var f file
-
-	if _, err := f.ReadFrom(r); err != nil {
-		return image.Config{}, err
-	}
-
-	fw, fh := factorPowerOfTwo(len(f.frames))
-	if f.framew > f.frameh {
-		fw, fh = fh, fw
-	}
-
-	var colorModel color.Model
-
-	switch f.bpp {
-	case 8:
-		f.initPalette()
-		colorModel = f.palette
-	case 16:
-		colorModel = color.Gray16Model
-	default:
-		colorModel = color.RGBAModel
-	}
-
-	return image.Config{
-		ColorModel: colorModel,
-		Width:      f.framew * fw,
-		Height:     f.frameh * fh,
-	}, nil
+// decodeConfig adapts the variadic, budget-aware DecodeConfig to the
+// image.Format signature. Registered formats always run without a budget.
+func decodeConfig(r io.Reader) (image.Config, error) {
+	return DecodeConfig(r)
 }
 
 func init() {
-	image.RegisterFormat("aseprite", "????\xE0\xA5", Decode, DecodeConfig)
+	image.RegisterFormat("aseprite", "????\xE0\xA5", decode, decodeConfig)
 }

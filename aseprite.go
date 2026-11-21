@@ -97,14 +97,21 @@ type Aseprite struct {
 	LayerData [][]byte
 }
 
-func (spr *Aseprite) readFrom(r io.Reader) error {
+func (spr *Aseprite) readFrom(r io.Reader, opts ...Option) error {
+	o := decodeOptions{}
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	var f file
 
-	if _, err := f.ReadFrom(r); err != nil {
+	if _, err := f.readFile(r, o.budget); err != nil {
 		return err
 	}
 
-	f.initPalette()
+	if err := f.initPalette(); err != nil {
+		return err
+	}
 
 	if err := f.initLayers(); err != nil {
 		return err

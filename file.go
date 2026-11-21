@@ -1,7 +1,6 @@
 package aseprite
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"image"
@@ -13,8 +12,6 @@ import (
 
 	"github.com/askeladdk/aseprite/internal/blend"
 )
-
-var errInvalidMagic = errors.New("invalid magic number")
 
 type cel struct {
 	image image.Image
@@ -80,6 +77,9 @@ type layer struct {
 }
 
 func (l *layer) Parse(raw []byte) error {
+	if !at(raw, 0, 13) {
+		return &syntaxError{msg: "truncated layer chunk", offset: -1}
+	}
 	if typ := binary.LittleEndian.Uint16(raw[2:]); typ == 2 {
 		return errors.New("tilemap layers not supported")
 	}
@@ -90,19 +90,42 @@ func (l *layer) Parse(raw []byte) error {
 }
 
 type chunk struct {
-	typ int
-	raw []byte
+	typ    int
+	raw    []byte
+	offset int64
 }
 
-func (c chunk) Reader() io.Reader {
-	return bytes.NewReader(c.raw)
-}
+// readChunk reads one chunk from r. r must be a bounded reader whose remaining
+// capacity is the bytes left in the enclosing frame. base is the stream offset
+// of the chunk's first byte. The declared chunk length is validated against
+// both that remaining capacity and the chunk budget before the payload buffer
+// is allocated, so an oversized chunk never triggers a large allocation.
+func (c *chunk) readChunk(r *boundedReader, base int64, b Budget) error {
+	var hdr [6]byte
+	if err := readFull(r, hdr[:], base); err != nil {
+		return err
+	}
 
-func (c *chunk) Read(raw []byte) ([]byte, error) {
-	chunkLen := binary.LittleEndian.Uint32(raw)
-	c.typ = int(binary.LittleEndian.Uint16(raw[4:]))
-	c.raw = raw[6:chunkLen]
-	return raw[chunkLen:], nil
+	chunkLen := int64(binary.LittleEndian.Uint32(hdr[:]))
+	if chunkLen < 6 {
+		return &syntaxError{msg: "chunk length smaller than chunk header", offset: base}
+	}
+	// Reject before allocating: a chunk cannot extend past the frame it is in.
+	if chunkLen-6 > r.N {
+		return &syntaxError{msg: "chunk extends past end of frame", offset: base}
+	}
+	if err := checkBudget(int64(b.MaxChunkLength), "MaxChunkLength", "chunk", chunkLen, base); err != nil {
+		return err
+	}
+
+	payloadLen := chunkLen - 6
+	c.typ = int(binary.LittleEndian.Uint16(hdr[4:]))
+	c.offset = base
+	c.raw = make([]byte, payloadLen)
+	if err := readFull(r, c.raw, base+6); err != nil {
+		return err
+	}
+	return nil
 }
 
 type frame struct {
@@ -111,34 +134,66 @@ type frame struct {
 	cels   []cel
 }
 
-func (f *frame) Read(raw []byte) ([]byte, error) {
-	if magic := binary.LittleEndian.Uint16(raw[4:]); magic != 0xF1FA {
-		return nil, errInvalidMagic
+// readFrame reads one frame and all of its chunks from r. r must be the
+// file-level bounded reader; base is the stream offset of the frame header.
+func (fr *frame) readFrame(r *boundedReader, base int64, b Budget) error {
+	var hdr [16]byte
+	if err := readFull(r, hdr[:], base); err != nil {
+		return err
 	}
 
-	// frameLen := binary.LittleEndian.Uint32(raw[0:])
-	oldChunks := binary.LittleEndian.Uint16(raw[6:])
-	durationMS := binary.LittleEndian.Uint16(raw[8:])
-	newChunks := binary.LittleEndian.Uint32(raw[12:])
+	frameLen := int64(binary.LittleEndian.Uint32(hdr[:]))
+	if frameLen < 16 {
+		return &syntaxError{msg: "frame length smaller than frame header", offset: base}
+	}
+	// A frame cannot extend past the bytes remaining in the file section.
+	if frameLen-16 > r.N {
+		return &syntaxError{msg: "frame extends past end of file", offset: base}
+	}
+	if magic := binary.LittleEndian.Uint16(hdr[4:]); magic != 0xF1FA {
+		return &syntaxError{msg: "invalid frame magic number", offset: base + 4}
+	}
 
-	f.dur = time.Millisecond * time.Duration(durationMS)
+	oldChunks := binary.LittleEndian.Uint16(hdr[6:])
+	durationMS := binary.LittleEndian.Uint16(hdr[8:])
+	newChunks := binary.LittleEndian.Uint32(hdr[12:])
 
-	nchunks := int(newChunks)
+	fr.dur = time.Millisecond * time.Duration(durationMS)
+
+	nchunks := int64(newChunks)
 	if nchunks == 0 {
-		nchunks = int(oldChunks)
+		nchunks = int64(oldChunks)
+	}
+	if nchunks <= 0 {
+		return &syntaxError{msg: "frame declares no chunks", offset: base + 12}
+	}
+	// Every chunk occupies at least its 6-byte header within the frame body,
+	// so the declared count cannot exceed what the frame can physically hold.
+	if nchunks > (frameLen-16)/6 {
+		return &syntaxError{msg: "chunk count exceeds frame length", offset: base + 12}
 	}
 
-	f.chunks = make([]chunk, nchunks)
+	// Read the frame body through a reader bounded to the declared frame size
+	// so a malformed chunk length cannot read into the next frame.
+	body := &boundedReader{R: r, N: frameLen - 16}
+	fr.chunks = make([]chunk, 0, nchunks)
 
-	raw = raw[16:]
-
-	for i := 0; i < nchunks; i++ {
+	pos := base + 16
+	for i := int64(0); i < nchunks; i++ {
 		var c chunk
-		raw, _ = c.Read(raw)
-		f.chunks[i] = c
+		if err := c.readChunk(body, pos, b); err != nil {
+			return err
+		}
+		pos += 6 + int64(len(c.raw))
+		fr.chunks = append(fr.chunks, c)
 	}
 
-	return raw, nil
+	// The declared frame length must account exactly for the chunks consumed;
+	// any leftover bytes mean the chunk lengths or count were inconsistent.
+	if body.N != 0 {
+		return &syntaxError{msg: "frame length does not match its chunks", offset: base}
+	}
+	return nil
 }
 
 type file struct {
@@ -151,31 +206,58 @@ type file struct {
 	frames      []frame
 	layers      []layer
 	makeCel     func(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel
+	budget      Budget
+	celBytes    int64
 }
 
-func (f *file) ReadFrom(r io.Reader) (int64, error) {
+// readFile reads and parses the entire serialized file. Every limit in b is
+// enforced before the resource it guards is allocated. The returned byte count
+// is the number of bytes consumed from r.
+func (f *file) readFile(r io.Reader, b Budget) (int64, error) {
+	f.budget = b
+
 	var hdr [128]byte
 
 	raw := hdr[:]
 
-	if n, err := io.ReadFull(r, raw); err != nil {
+	n, err := io.ReadFull(r, raw)
+	if err != nil {
 		return int64(n), err
 	}
 
 	if magic := binary.LittleEndian.Uint16(raw[4:]); magic != 0xA5E0 {
-		return 128, errInvalidMagic
+		return 128, &syntaxError{msg: "invalid magic number", offset: 4}
 	}
 
 	if pixw, pixh := raw[34], raw[35]; pixw != pixh {
-		return 128, errors.New("unsupported pixel ratio")
+		return 128, &syntaxError{msg: "unsupported pixel ratio", offset: 34}
 	}
 
 	f.bpp = binary.LittleEndian.Uint16(raw[12:])
 	f.flags = binary.LittleEndian.Uint16(raw[14:])
-	f.frames = make([]frame, 0, binary.LittleEndian.Uint16(raw[6:]))
+
+	declaredFrames := int64(binary.LittleEndian.Uint16(raw[6:]))
+	if declaredFrames <= 0 {
+		return 128, &syntaxError{msg: "frame count must be greater than zero", offset: 6}
+	}
+	if err := checkBudget(int64(b.MaxFrames), "MaxFrames", "header", declaredFrames, 6); err != nil {
+		return 128, err
+	}
+
 	f.framew = int(binary.LittleEndian.Uint16(raw[8:]))
 	f.frameh = int(binary.LittleEndian.Uint16(raw[10:]))
-	f.palette = make(color.Palette, binary.LittleEndian.Uint16(raw[32:]))
+	if f.framew <= 0 || f.frameh <= 0 {
+		return 128, &syntaxError{msg: "canvas dimensions must be greater than zero", offset: 8}
+	}
+	npixels, ok := mulInt64(int64(f.framew), int64(f.frameh))
+	if !ok {
+		return 128, &syntaxError{msg: "canvas pixel count overflows", offset: 8}
+	}
+	if err := checkBudget(int64(b.MaxPixels), "MaxPixels", "header", npixels, 8); err != nil {
+		return 128, err
+	}
+
+	paletteSize := int(binary.LittleEndian.Uint16(raw[32:]))
 	f.transparent = raw[28]
 
 	switch f.bpp {
@@ -186,29 +268,70 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 	case 32:
 		f.makeCel = makeCelImage32
 	default:
-		return 0, errors.New("invalid color depth")
+		return 128, &syntaxError{msg: "invalid color depth", offset: 12}
 	}
 
+	f.palette = make(color.Palette, paletteSize)
 	for i := range f.palette {
 		f.palette[i] = color.Black
 	}
-	f.palette[f.transparent] = color.Transparent
-
-	fileSize := int64(binary.LittleEndian.Uint32(raw))
-	raw = make([]byte, fileSize-128)
-
-	if n, err := io.ReadFull(r, raw); err != nil {
-		return int64(128 + n), err
+	if int(f.transparent) < len(f.palette) {
+		f.palette[f.transparent] = color.Transparent
 	}
 
-	for len(raw) > 0 {
+	// The declared file size bounds every subsequent read. It is validated
+	// against the budget up front, and the body is streamed frame by frame
+	// rather than buffered into a single file-size allocation.
+	fileSize := int64(binary.LittleEndian.Uint32(raw))
+	if fileSize < 128 {
+		return 128, &syntaxError{msg: "file size smaller than header", offset: 0}
+	}
+	if err := checkBudget(int64(b.MaxFileBytes), "MaxFileBytes", "header", fileSize, 0); err != nil {
+		return 128, err
+	}
+
+	// All reads of the frame section are capped at the declared size, so a
+	// length field can never drive an allocation beyond MaxFileBytes.
+	body := &boundedReader{R: r, N: fileSize - 128}
+	f.frames = make([]frame, 0, declaredFrames)
+
+	offset := int64(128)
+	for body.N > 0 {
+		if err := checkBudget(int64(b.MaxFrames), "MaxFrames", "frame",
+			int64(len(f.frames))+1, offset); err != nil {
+			return offset, err
+		}
+
 		var fr frame
-		var err error
-		if raw, err = fr.Read(raw); err != nil {
-			return fileSize, err
+		if err := fr.readFrame(body, offset, b); err != nil {
+			return offset, err
+		}
+
+		// Layer chunks only appear in the first frame. Count them here so that
+		// DecodeConfig, which never initializes cels, enforces the same layer
+		// budget as Read and Decode.
+		if len(f.frames) == 0 {
+			nlayers := 0
+			for _, ch := range fr.chunks {
+				if ch.typ == 0x2004 {
+					nlayers++
+				}
+			}
+			if err := checkBudget(int64(b.MaxLayers), "MaxLayers", "first frame",
+				int64(nlayers), offset); err != nil {
+				return offset, err
+			}
 		}
 
 		f.frames = append(f.frames, fr)
+		offset = fileSize - body.N
+	}
+
+	if int64(len(f.frames)) != declaredFrames {
+		return fileSize, &syntaxError{
+			msg:    "frame count does not match header",
+			offset: 6,
+		}
 	}
 
 	return fileSize, nil
