@@ -1,9 +1,19 @@
-// Package aseprite implements a decoder for Aseprite sprite files.
+// Package aseprite implements a decoder and a controlled encoder for Aseprite
+// sprite files.
 //
 // Layers are flattened, blending modes are applied,
 // and frames are arranged on a single texture atlas.
 // Invisible and reference layers are ignored.
 // Tilesets and external files are not supported.
+//
+// Use Read or image.Decode to decode a file. To write a file, build a Sprite
+// and call its WriteTo method, optionally passing WithCompressedCels. The
+// encoder supports the indexed (8 bpp), grayscale (16 bpp) and RGBA (32 bpp)
+// color depths, frame durations, layer/cel/tag/slice user data, animation
+// tags, slices (with 9-patch centers and pivots), the transparent palette
+// index, raw and zlib-compressed cels and linked cels. The whole document is
+// validated and encoded into a buffer before anything is written, so an
+// error never produces a partial file or modifies the input.
 //
 // Aseprite file format spec: https://github.com/aseprite/aseprite/blob/main/docs/ase-file-specs.md
 package aseprite

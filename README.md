@@ -53,6 +53,42 @@ sprite, err := aseprite.Read(f)
 
 Read the [documentation](https://pkg.go.dev/github.com/askeladdk/aseprite) for more information about what meta data is extracted.
 
+## Encoding
+
+Build a `Sprite` and call its `WriteTo` method to write a standard Aseprite
+file. The encoder supports 8/16/32 bpp, frame durations, layer/cel/tag/slice
+user data, tags, slices (9-patch centers and pivots), the transparent palette
+index, linked cels and optional zlib-compressed cels:
+
+```go
+doc := &aseprite.Sprite{
+    Width:  8,
+    Height: 8,
+    BPP:    aseprite.Indexed8,
+    Palette: color.Palette{color.Transparent, color.NRGBA{255, 0, 0, 255}},
+    TransparentIndex: 0,
+    Layers: []aseprite.SpriteLayer{
+        {Name: "base", Visible: true, Opacity: 255},
+    },
+    Frames: []aseprite.SpriteFrame{{
+        Duration: 100 * time.Millisecond,
+        Cels: []aseprite.SpriteCel{{
+            Layer:       0,
+            LinkedFrame: -1,
+            Bounds:      image.Rect(0, 0, 8, 8),
+            Opacity:     255,
+            Image:       paletted, // *image.Paletted, *image.Gray16 or *image.NRGBA
+        }},
+    }},
+}
+
+// Raw cels by default; pass aseprite.WithCompressedCels() for zlib cels.
+if _, err := doc.WriteTo(f); err != nil {
+    // Handle validation or write error. The input document is never
+    // modified and no partial file is produced.
+}
+```
+
 ## License
 
 Package aseprite is released under the terms of the ISC license.
