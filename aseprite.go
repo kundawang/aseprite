@@ -59,14 +59,19 @@ type Frame struct {
 
 // Slice represents a single slice.
 type Slice struct {
-	// Bounds is the bounds of the image in the texture atlas.
+	// Bounds is the bounds of the slice image relative to the frame
+	// it applies to. See Frame.
 	Bounds image.Rectangle
 
 	// Center is the 9-slices center relative to Bounds.
+	// A zero rectangle means the slice has no 9-slice information.
 	Center image.Rectangle
 
 	// Pivot is the pivot point relative to Bounds.
 	Pivot image.Point
+
+	// Frame is the number of the frame the slice key applies to.
+	Frame int
 
 	// Name is the name of the slice. Can be duplicate.
 	Name string

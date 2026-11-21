@@ -204,7 +204,7 @@ func (f *file) buildTags() []Tag {
 }
 
 func parseSlice(s *Slice, flags uint32, raw []byte) []byte {
-	// framenum := binary.LittleEndian.Uint32(raw)
+	framenum := binary.LittleEndian.Uint32(raw)
 	x := int32(binary.LittleEndian.Uint32(raw[4:]))
 	y := int32(binary.LittleEndian.Uint32(raw[8:]))
 	w := binary.LittleEndian.Uint32(raw[12:])
@@ -233,6 +233,7 @@ func parseSlice(s *Slice, flags uint32, raw []byte) []byte {
 	s.Bounds = image.Rect(int(x), int(y), int(x)+int(w), int(y)+int(h))
 	s.Center = image.Rect(int(cx), int(cy), int(cx)+int(cw), int(cy)+int(ch))
 	s.Pivot = image.Pt(int(px), int(py))
+	s.Frame = int(framenum)
 
 	return raw
 }

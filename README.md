@@ -51,6 +51,21 @@ Alternatively, use the `Read` function to directly decode an image to `aseprite.
 sprite, err := aseprite.Read(f)
 ```
 
+## Nine-slice scaling
+
+Slices with a center rectangle can be drawn scaled to any target rectangle using nine-slice (9-patch) scaling, so rounded corners and borders keep their shape. `DrawSlice` reads the slice image from the texture atlas at the frame the slice key applies to and returns the pivot mapped into destination coordinates:
+
+```go
+sprite, err := aseprite.Read(f)
+dst := image.NewRGBA(image.Rect(0, 0, 200, 100))
+pivot := sprite.DrawSlice(dst, sprite.Slices[0], dst.Bounds(), aseprite.SliceOptions{
+    Filter:   aseprite.Nearest,  // or aseprite.Linear
+    Overflow: aseprite.Clip,     // or aseprite.Compress
+})
+```
+
+Slices without a center are stretched as a whole. When the target is smaller than the sum of the edge sizes, `Overflow` selects between clipping and proportionally compressing the edges.
+
 Read the [documentation](https://pkg.go.dev/github.com/askeladdk/aseprite) for more information about what meta data is extracted.
 
 ## License
