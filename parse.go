@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
-	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"io"
@@ -103,11 +103,19 @@ func (f *file) initLayers() error {
 }
 
 func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
-	layer := binary.LittleEndian.Uint16(raw)
+	if len(raw) < 16 {
+		return nil, fmt.Errorf("aseprite: frame %d: cel chunk too short (%d bytes)", frame, len(raw))
+	}
+
+	layer := int(binary.LittleEndian.Uint16(raw))
 	xpos := int(binary.LittleEndian.Uint16(raw[2:]))
 	ypos := int(binary.LittleEndian.Uint16(raw[4:]))
 	opacity := raw[6]
 	celtype := binary.LittleEndian.Uint16(raw[7:])
+
+	if layer >= len(f.layers) {
+		return nil, fmt.Errorf("aseprite: frame %d: cel references invalid layer %d", frame, layer)
+	}
 
 	// invisible layer
 	if f.layers[layer].flags&1 == 0 {
@@ -123,34 +131,66 @@ func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
 
 	opacity = byte((int(opacity) * int(f.layers[layer].opacity)) / 255)
 
+	// npix is the expected number of pixel bytes for image cels.
+	npix := func(width, height int) int {
+		return width * height * int(f.bpp) / 8
+	}
+
 	switch celtype {
 	case 0: // uncompressed image
+		if len(raw) < 4 {
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: image cel chunk too short (%d bytes)", frame, layer, len(raw))
+		}
 		width := int(binary.LittleEndian.Uint16(raw))
 		height := int(binary.LittleEndian.Uint16(raw[2:]))
 		pix := raw[4:]
+		if n := npix(width, height); len(pix) < n {
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: image cel has %d bytes of pixel data, expected %d", frame, layer, len(pix), n)
+		}
 		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
 		cel := f.makeCel(f, bounds, opacity, pix)
 		f.frames[frame].cels[layer] = cel
 	case 1: // linked cel
+		if len(raw) < 2 {
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: linked cel chunk too short (%d bytes)", frame, layer, len(raw))
+		}
 		srcFrame := int(binary.LittleEndian.Uint16(raw))
-		srcCel := f.frames[srcFrame].cels[layer]
-		f.frames[frame].cels[layer] = srcCel
+		if srcFrame >= len(f.frames) {
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: linked cel references frame %d, but the file has only %d frames", frame, layer, srcFrame, len(f.frames))
+		}
+		if srcFrame >= frame {
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: linked cel references frame %d: forward and cyclic links are invalid", frame, layer, srcFrame)
+		}
+		// The source frame precedes the current frame, so it has been
+		// fully parsed and its cel fully resolved. Copying the cel shares
+		// the underlying pixel data (and opacity mask) in O(1) without
+		// recursion, no matter how long the chain of links is. A link to
+		// an empty cel copies the zero cel and decodes as transparent.
+		f.frames[frame].cels[layer] = f.frames[srcFrame].cels[layer]
 	case 2: // compressed image
+		if len(raw) < 4 {
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: compressed cel chunk too short (%d bytes)", frame, layer, len(raw))
+		}
 		width := int(binary.LittleEndian.Uint16(raw))
 		height := int(binary.LittleEndian.Uint16(raw[2:]))
 		zr, err := zlib.NewReader(bytes.NewReader(raw[4:]))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: %w", frame, layer, err)
 		}
-		pix, err := io.ReadAll(zr)
+		// Bound the decompressed size to the expected pixel data size.
+		n := npix(width, height)
+		pix, err := io.ReadAll(io.LimitReader(zr, int64(n)))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: %w", frame, layer, err)
+		}
+		if len(pix) < n {
+			return nil, fmt.Errorf("aseprite: frame %d layer %d: compressed cel has %d bytes of pixel data, expected %d", frame, layer, len(pix), n)
 		}
 		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
 		cel := f.makeCel(f, bounds, opacity, pix)
 		f.frames[frame].cels[layer] = cel
 	default:
-		return nil, errors.New("unsupported cel type")
+		return nil, fmt.Errorf("aseprite: frame %d layer %d: unsupported cel type %d", frame, layer, celtype)
 	}
 
 	return &f.frames[frame].cels[layer], nil
