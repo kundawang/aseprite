@@ -53,6 +53,42 @@ sprite, err := aseprite.Read(f)
 
 Read the [documentation](https://pkg.go.dev/github.com/askeladdk/aseprite) for more information about what meta data is extracted.
 
+## Indexed color export
+
+Retro hardware often only accepts 8 bits per pixel texture atlases. Use
+`Quantize` to reduce a true color frame or atlas to a paletted image:
+
+```go
+img, report, err := aseprite.Quantize(sprite, aseprite.QuantizeOptions{
+    PaletteSize:      16,    // number of palette entries (1-256, default 256)
+    TransparentIndex: 0,     // reserved index for fully transparent pixels, or -1
+    Metric:           aseprite.Euclidean, // Euclidean, Manhattan or RedMean
+    Dither:           aseprite.FloydSteinberg, // or DitherNone
+})
+```
+
+The returned `*image.Paletted` is a standard library image and the
+`QuantizeReport` records how every pixel was mapped: exact matches,
+approximated colors, fully transparent and semi-transparent pixel counts,
+per-index usage and normalized error statistics.
+
+Deterministic mapping rules:
+
+- Fully transparent pixels (alpha 0) always land on the reserved
+  `TransparentIndex`; the reserved entry is never assigned quantized colors.
+- Semi-transparent pixels keep their full alpha channel and take part in
+  palette construction together with opaque pixels.
+- Colors that do not fit in the palette are mapped to their nearest palette
+  entry using the selected error metric, with ties resolved by the lowest
+  palette index. Identical inputs always produce identical outputs.
+
+`QuantizeFrames` quantizes every frame of a sprite, optionally sharing one
+palette across all frames so frame colors stay consistent in the atlas.
+
+The input image is never modified. Empty images, 16 bpp grayscale images,
+invalid palette parameters and images exceeding the documented resource
+limits (`MaxImageDimension`, `MaxPixels`) return explicit errors.
+
 ## License
 
 Package aseprite is released under the terms of the ISC license.
