@@ -1,7 +1,6 @@
 package aseprite
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -76,6 +75,9 @@ type layer struct {
 }
 
 func (l *layer) Parse(raw []byte) error {
+	if len(raw) < 13 {
+		return errors.New("layer chunk too short")
+	}
 	if typ := binary.LittleEndian.Uint16(raw[2:]); typ == 2 {
 		return errors.New("tilemap layers not supported")
 	}
@@ -90,52 +92,64 @@ type chunk struct {
 	raw []byte
 }
 
-func (c chunk) Reader() io.Reader {
-	return bytes.NewReader(c.raw)
-}
-
-func (c *chunk) Read(raw []byte) ([]byte, error) {
-	chunkLen := binary.LittleEndian.Uint32(raw)
-	c.typ = int(binary.LittleEndian.Uint16(raw[4:]))
-	c.raw = raw[6:chunkLen]
-	return raw[chunkLen:], nil
-}
-
-type frame struct {
-	dur    time.Duration
-	chunks []chunk
-	cels   []cel
-}
-
-func (f *frame) Read(raw []byte) ([]byte, error) {
-	if magic := binary.LittleEndian.Uint16(raw[4:]); magic != 0xF1FA {
-		return nil, errInvalidMagic
+// parseFrame validates and splits a single raw frame record. raw must start
+// at the frame header and may extend past the end of the frame; the
+// remainder is returned as rest. frameIdx is only used for error reporting.
+func parseFrame(raw []byte, frameIdx int) (fr frame, rest []byte, err error) {
+	if len(raw) < 16 {
+		return fr, nil, &FrameError{frameIdx, io.ErrUnexpectedEOF}
 	}
 
-	// frameLen := binary.LittleEndian.Uint32(raw[0:])
+	if magic := binary.LittleEndian.Uint16(raw[4:]); magic != 0xF1FA {
+		return fr, nil, &FrameError{frameIdx, errInvalidMagic}
+	}
+
+	frameLen := int(binary.LittleEndian.Uint32(raw[0:]))
+	if frameLen < 16 || frameLen > len(raw) {
+		return fr, nil, &FrameError{frameIdx, fmt.Errorf("invalid frame length %d (%d bytes remaining)", frameLen, len(raw))}
+	}
+
 	oldChunks := binary.LittleEndian.Uint16(raw[6:])
 	durationMS := binary.LittleEndian.Uint16(raw[8:])
 	newChunks := binary.LittleEndian.Uint32(raw[12:])
 
-	f.dur = time.Millisecond * time.Duration(durationMS)
+	fr.dur = time.Millisecond * time.Duration(durationMS)
 
 	nchunks := int(newChunks)
 	if nchunks == 0 {
 		nchunks = int(oldChunks)
 	}
 
-	f.chunks = make([]chunk, nchunks)
-
-	raw = raw[16:]
-
-	for i := 0; i < nchunks; i++ {
-		var c chunk
-		raw, _ = c.Read(raw)
-		fmt.Printf("chunk 0x%x %d\n", c.typ, len(c.raw))
-		f.chunks[i] = c
+	if nchunks > (frameLen-16)/6 {
+		return fr, nil, &FrameError{frameIdx, fmt.Errorf("chunk count %d exceeds frame length %d", nchunks, frameLen)}
 	}
 
-	return raw, nil
+	fr.chunks = make([]chunk, 0, nchunks)
+
+	pos := 16
+	for i := 0; i < nchunks; i++ {
+		chunkLen := int(binary.LittleEndian.Uint32(raw[pos:]))
+		if chunkLen < 6 || pos+chunkLen > frameLen {
+			return fr, nil, &FrameError{frameIdx, fmt.Errorf("chunk %d: invalid chunk length %d", i, chunkLen)}
+		}
+		fr.chunks = append(fr.chunks, chunk{
+			typ: int(binary.LittleEndian.Uint16(raw[pos+4:])),
+			raw: raw[pos+6 : pos+chunkLen],
+		})
+		pos += chunkLen
+	}
+
+	if pos != frameLen {
+		return fr, nil, &FrameError{frameIdx, fmt.Errorf("%d trailing bytes after last chunk", frameLen-pos)}
+	}
+
+	return fr, raw[frameLen:], nil
+}
+
+type frame struct {
+	dur    time.Duration
+	chunks []chunk
+	cels   []cel
 }
 
 type file struct {
@@ -150,26 +164,19 @@ type file struct {
 	makeCel     func(f *file, bounds image.Rectangle, opacity byte, pix []byte) cel
 }
 
-func (f *file) ReadFrom(r io.Reader) (int64, error) {
-	var hdr [128]byte
-
-	raw := hdr[:]
-
-	if n, err := io.ReadFull(r, raw); err != nil {
-		return int64(n), err
-	}
-
+// readHeader parses the 128-byte file header and returns the file size
+// declared in it.
+func (f *file) readHeader(raw []byte) (int64, error) {
 	if magic := binary.LittleEndian.Uint16(raw[4:]); magic != 0xA5E0 {
-		return 128, errInvalidMagic
+		return 0, errInvalidMagic
 	}
 
 	if pixw, pixh := raw[34], raw[35]; pixw != pixh {
-		return 128, errors.New("unsupported pixel ratio")
+		return 0, errors.New("unsupported pixel ratio")
 	}
 
 	f.bpp = binary.LittleEndian.Uint16(raw[12:])
 	f.flags = binary.LittleEndian.Uint16(raw[14:])
-	f.frames = make([]frame, 0, binary.LittleEndian.Uint16(raw[6:]))
 	f.framew = int(binary.LittleEndian.Uint16(raw[8:]))
 	f.frameh = int(binary.LittleEndian.Uint16(raw[10:]))
 	f.palette = make(color.Palette, binary.LittleEndian.Uint16(raw[32:]))
@@ -189,10 +196,32 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 	for i := range f.palette {
 		f.palette[i] = color.Black
 	}
-	f.palette[f.transparent] = color.Transparent
+	if int(f.transparent) < len(f.palette) {
+		f.palette[f.transparent] = color.Transparent
+	}
 
-	fileSize := int64(binary.LittleEndian.Uint32(raw))
-	raw = make([]byte, fileSize-128)
+	return int64(binary.LittleEndian.Uint32(raw)), nil
+}
+
+func (f *file) ReadFrom(r io.Reader) (int64, error) {
+	var hdr [128]byte
+
+	if n, err := io.ReadFull(r, hdr[:]); err != nil {
+		return int64(n), err
+	}
+
+	fileSize, err := f.readHeader(hdr[:])
+	if err != nil {
+		return 128, err
+	}
+
+	if fileSize < 128 {
+		return 128, errors.New("invalid file size")
+	}
+
+	f.frames = make([]frame, 0, binary.LittleEndian.Uint16(hdr[6:]))
+
+	raw := make([]byte, fileSize-128)
 
 	if n, err := io.ReadFull(r, raw); err != nil {
 		return int64(128 + n), err
@@ -201,7 +230,7 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 	for len(raw) > 0 {
 		var fr frame
 		var err error
-		if raw, err = fr.Read(raw); err != nil {
+		if fr, raw, err = parseFrame(raw, len(f.frames)); err != nil {
 			return fileSize, err
 		}
 
@@ -209,6 +238,34 @@ func (f *file) ReadFrom(r io.Reader) (int64, error) {
 	}
 
 	return fileSize, nil
+}
+
+// drawCels composites a frame's cels onto dst. scratch is used as a
+// temporary for blend modes and must have the same bounds as dst.
+func drawCels(dst, scratch *image.RGBA, layers []layer, cels []cel) {
+	framebounds := dst.Bounds()
+	transparent := &image.Uniform{color.Transparent}
+
+	draw.Draw(dst, framebounds, transparent, image.Point{}, draw.Src)
+
+	for layer, c := range cels {
+		if c.image == nil {
+			continue
+		}
+
+		src := c.image
+		sr := src.Bounds()
+		sp := sr.Min
+
+		if mode := layers[layer].blendMode; mode > 0 && int(mode) < len(blend.Modes) {
+			draw.Draw(scratch, framebounds, transparent, image.Point{}, draw.Src)
+			blend.Blend(scratch, sr.Sub(sp), src, sp, dst, sp, blend.Modes[mode])
+			src = scratch
+			sp = image.Point{}
+		}
+
+		draw.DrawMask(dst, sr, src, sp, c.mask, image.Point{}, draw.Over)
+	}
 }
 
 func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
@@ -221,29 +278,8 @@ func (f *file) buildAtlas() (atlas draw.Image, framesr []image.Rectangle) {
 	dstblend := image.NewRGBA(framebounds)
 	dst := image.NewRGBA(framebounds)
 
-	transparent := &image.Uniform{color.Transparent}
-
 	for i, fr := range f.frames {
-		draw.Draw(dst, framebounds, transparent, image.Point{}, draw.Src)
-		for layer, c := range fr.cels {
-			if c.image == nil {
-				continue
-			}
-
-			src := c.image
-			sr := src.Bounds()
-			sp := sr.Min
-
-			if mode := f.layers[layer].blendMode; mode > 0 && int(mode) < len(blend.Modes) {
-				draw.Draw(dstblend, framebounds, transparent, image.Point{}, draw.Src)
-				blend.Blend(dstblend, sr.Sub(sp), src, sp, dst, sp, blend.Modes[mode])
-				src = dstblend
-				sp = image.Point{}
-			}
-
-			draw.DrawMask(dst, sr, src, sp, c.mask, image.Point{}, draw.Over)
-		}
-
+		drawCels(dst, dstblend, f.layers, fr.cels)
 		draw.Draw(atlas, framesr[i], dst, image.Point{}, draw.Src)
 	}
 

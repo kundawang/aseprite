@@ -4,6 +4,10 @@
 // and frames are arranged on a single texture atlas.
 // Invisible and reference layers are ignored.
 // Tilesets and external files are not supported.
+//
+// Read and ReadFrom decode the whole file eagerly. For large animations,
+// OpenIndex and ScanIndex build a frame index first and decode individual
+// frames lazily; see the Index documentation.
 package aseprite
 
 import (
@@ -104,7 +108,9 @@ func (spr *Aseprite) ReadFrom(r io.Reader) (n int64, err error) {
 		return
 	}
 
-	f.initPalette()
+	if err = f.initPalette(); err != nil {
+		return
+	}
 
 	if err = f.initLayers(); err != nil {
 		return

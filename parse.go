@@ -5,18 +5,20 @@ import (
 	"compress/zlib"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"io"
 )
 
-func skipString(raw []byte) []byte {
-	n := binary.LittleEndian.Uint16(raw)
-	return raw[2+n:]
-}
-
 func parseString(raw []byte) string {
-	n := binary.LittleEndian.Uint16(raw)
+	if len(raw) < 2 {
+		return ""
+	}
+	n := int(binary.LittleEndian.Uint16(raw))
+	if len(raw) < 2+n {
+		return ""
+	}
 	return string(raw[2 : 2+n])
 }
 
@@ -30,49 +32,88 @@ func parseColor(raw []byte) color.Color {
 }
 
 func parseUserData(raw []byte) (data []byte, color color.Color) {
+	if len(raw) < 4 {
+		return nil, nil
+	}
+
 	flags := binary.LittleEndian.Uint32(raw)
 	raw = raw[4:]
 
 	if flags&1 != 0 {
-		n := binary.LittleEndian.Uint16(raw)
+		if len(raw) < 2 {
+			return nil, nil
+		}
+		n := int(binary.LittleEndian.Uint16(raw))
+		if len(raw) < 2+n {
+			return nil, nil
+		}
 		data, raw = raw[2:2+n], raw[2+n:]
 	}
 
-	if flags&2 != 0 {
+	if flags&2 != 0 && len(raw) >= 4 {
 		color = parseColor(raw)
 	}
 
 	return
 }
 
-func (f *file) parseChunk2019(raw []byte) {
+func (f *file) parseChunk2019(raw []byte) error {
+	if len(raw) < 20 {
+		return io.ErrUnexpectedEOF
+	}
+
 	entries := binary.LittleEndian.Uint32(raw[0:])
 	lo := binary.LittleEndian.Uint32(raw[4:])
 
 	raw = raw[20:]
 
 	for i := uint32(0); i < entries; i++ {
+		if len(raw) < 6 {
+			return io.ErrUnexpectedEOF
+		}
+
 		flags := binary.LittleEndian.Uint16(raw)
-		f.palette[lo+i] = parseColor(raw[2:])
+		if idx := int(lo + i); idx < len(f.palette) {
+			f.palette[idx] = parseColor(raw[2:])
+		}
 		raw = raw[6:]
 
 		if flags&1 != 0 {
-			raw = skipString(raw)
+			if len(raw) < 2 {
+				return io.ErrUnexpectedEOF
+			}
+			n := int(binary.LittleEndian.Uint16(raw))
+			if len(raw) < 2+n {
+				return io.ErrUnexpectedEOF
+			}
+			raw = raw[2+n:]
 		}
+	}
+
+	return nil
+}
+
+// applyTransparent maps the transparent palette entry to color.Transparent
+// when the file header says it is valid.
+func (f *file) applyTransparent() {
+	if f.flags&1 != 0 && int(f.transparent) < len(f.palette) {
+		f.palette[f.transparent] = color.Transparent
 	}
 }
 
-func (f *file) initPalette() {
+func (f *file) initPalette() error {
 	for _, ch := range f.frames[0].chunks {
 		if ch.typ == 0x2019 {
-			f.parseChunk2019(ch.raw)
+			if err := f.parseChunk2019(ch.raw); err != nil {
+				return &FrameError{0, err}
+			}
 			break
 		}
 	}
 
-	if f.flags&1 != 0 {
-		f.palette[f.transparent] = color.Transparent
-	}
+	f.applyTransparent()
+
+	return nil
 }
 
 func (f *file) initLayers() error {
@@ -81,7 +122,7 @@ func (f *file) initLayers() error {
 		if ch.typ == 0x2004 {
 			var l layer
 			if err := l.Parse(ch.raw); err != nil {
-				return err
+				return &FrameError{0, err}
 			}
 
 			if i < len(chunks)-1 {
@@ -103,11 +144,19 @@ func (f *file) initLayers() error {
 }
 
 func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
-	layer := binary.LittleEndian.Uint16(raw)
+	if len(raw) < 16 {
+		return nil, errors.New("cel chunk too short")
+	}
+
+	layer := int(binary.LittleEndian.Uint16(raw))
 	xpos := int(binary.LittleEndian.Uint16(raw[2:]))
 	ypos := int(binary.LittleEndian.Uint16(raw[4:]))
 	opacity := raw[6]
 	celtype := binary.LittleEndian.Uint16(raw[7:])
+
+	if layer >= len(f.layers) {
+		return nil, fmt.Errorf("cel references invalid layer %d", layer)
+	}
 
 	// invisible layer
 	if f.layers[layer].flags&1 == 0 {
@@ -123,19 +172,39 @@ func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
 
 	opacity = byte((int(opacity) * int(f.layers[layer].opacity)) / 255)
 
+	pixsz := int(f.bpp / 8)
+
 	switch celtype {
 	case 0: // uncompressed image
+		if len(raw) < 4 {
+			return nil, errors.New("cel chunk too short")
+		}
 		width := int(binary.LittleEndian.Uint16(raw))
 		height := int(binary.LittleEndian.Uint16(raw[2:]))
 		pix := raw[4:]
+		if need := width * height * pixsz; len(pix) < need {
+			return nil, fmt.Errorf("cel pixel data truncated: need %d bytes, have %d", need, len(pix))
+		}
 		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
 		cel := f.makeCel(f, bounds, opacity, pix)
 		f.frames[frame].cels[layer] = cel
 	case 1: // linked cel
+		if len(raw) < 2 {
+			return nil, errors.New("cel chunk too short")
+		}
 		srcFrame := int(binary.LittleEndian.Uint16(raw))
+		if srcFrame >= frame {
+			return nil, fmt.Errorf("linked cel references frame %d (self or forward reference)", srcFrame)
+		}
+		if f.frames[srcFrame].cels == nil {
+			return nil, fmt.Errorf("linked cel source frame %d has not been decoded", srcFrame)
+		}
 		srcCel := f.frames[srcFrame].cels[layer]
 		f.frames[frame].cels[layer] = srcCel
 	case 2: // compressed image
+		if len(raw) < 4 {
+			return nil, errors.New("cel chunk too short")
+		}
 		width := int(binary.LittleEndian.Uint16(raw))
 		height := int(binary.LittleEndian.Uint16(raw[2:]))
 		zr, err := zlib.NewReader(bytes.NewReader(raw[4:]))
@@ -146,11 +215,14 @@ func (f *file) parseChunk2005(frame int, raw []byte) (*cel, error) {
 		if err != nil {
 			return nil, err
 		}
+		if need := width * height * pixsz; len(pix) < need {
+			return nil, fmt.Errorf("decompressed cel pixel data truncated: need %d bytes, have %d", need, len(pix))
+		}
 		bounds := image.Rect(xpos, ypos, xpos+width, ypos+height)
 		cel := f.makeCel(f, bounds, opacity, pix)
 		f.frames[frame].cels[layer] = cel
 	default:
-		return nil, errors.New("unsupported cel type")
+		return nil, fmt.Errorf("unsupported cel type %d", celtype)
 	}
 
 	return &f.frames[frame].cels[layer], nil
@@ -163,7 +235,7 @@ func (f *file) initCels() error {
 			if ch.typ == 0x2005 {
 				cel, err := f.parseChunk2005(i, ch.raw)
 				if err != nil {
-					return err
+					return &FrameError{i, err}
 				} else if cel != nil && j < (len(chunks)-1) {
 					// user data chunk
 					if ch2 := chunks[j+1]; ch2.typ == 0x2020 {
