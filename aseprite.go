@@ -96,6 +96,30 @@ type Aseprite struct {
 	LayerData [][]byte
 }
 
+// Bounds implements image.Image. It returns the bounds of the atlas.
+func (spr *Aseprite) Bounds() image.Rectangle {
+	if spr.Atlas == nil {
+		return image.Rectangle{}
+	}
+	return spr.Atlas.Bounds()
+}
+
+// ColorModel implements image.Image.
+func (spr *Aseprite) ColorModel() color.Model {
+	if spr.Atlas == nil {
+		return color.RGBAModel
+	}
+	return spr.Atlas.ColorModel()
+}
+
+// At implements image.Image.
+func (spr *Aseprite) At(x, y int) color.Color {
+	if spr.Atlas == nil {
+		return color.RGBA{}
+	}
+	return spr.Atlas.At(x, y)
+}
+
 // ReadFrom reads and parses an Aseprite file from a Reader.
 func (spr *Aseprite) ReadFrom(r io.Reader) (n int64, err error) {
 	var f file
@@ -104,7 +128,9 @@ func (spr *Aseprite) ReadFrom(r io.Reader) (n int64, err error) {
 		return
 	}
 
-	f.initPalette()
+	if err = f.initPalette(); err != nil {
+		return
+	}
 
 	if err = f.initLayers(); err != nil {
 		return
@@ -113,12 +139,18 @@ func (spr *Aseprite) ReadFrom(r io.Reader) (n int64, err error) {
 	}
 
 	var framesr []image.Rectangle
-	spr.Atlas, framesr = f.buildAtlas()
+	if spr.Atlas, framesr, err = f.buildAtlas(); err != nil {
+		return
+	}
 	userdata := f.buildUserData()
 	spr.Frames, userdata = f.buildFrames(framesr, userdata)
 	spr.LayerData = f.buildLayerData(userdata)
-	spr.Tags = f.buildTags()
-	spr.Slices = f.buildSlices()
+	if spr.Tags, err = f.buildTags(); err != nil {
+		return
+	}
+	if spr.Slices, err = f.buildSlices(); err != nil {
+		return
+	}
 	return
 }
 
